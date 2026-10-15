@@ -11,8 +11,8 @@ trap 'test_status=$?; if ((test_status)); then tail -50 "$test_dir/menu-output.l
 PYTHON=${PYTHON:-python3}
 
 # Load only definitions, avoiding package installation, downloads and the menu loop.
-source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/backhaul.sh" | sed '$d')
-source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/backhaul.sh" | sed '$d')
+source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/bh.sh" | sed '$d')
+source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/bh.sh" | sed '$d')
 config_dir="$test_dir"
 CERT_DIR="$test_dir/certs"
 CERT_FILE="$CERT_DIR/cert.crt"

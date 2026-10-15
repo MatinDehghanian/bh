@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define script version
-SCRIPT_VERSION="v1.2.0"
+SCRIPT_VERSION="v1.3.0"
 
 if ((BASH_VERSINFO[0] < 4)); then
     echo "This script requires Bash 4 or newer."
@@ -153,7 +153,7 @@ install_jq() {
     fi
 }
 
-download_backhaul() {
+download_bh() {
     if [[ "$1" == "menu" ]]; then
         colorize cyan "Restart all services after updating to new core" bold
         sleep 2
@@ -162,29 +162,30 @@ download_backhaul() {
         return 0
     fi
 
-    local download_url="https://raw.githubusercontent.com/MatinDehghanian/backhaul-script/refs/heads/main/backhaul"
+    local download_url="https://raw.githubusercontent.com/MatinDehghanian/bh/refs/heads/main/bh"
     local download_dir
     mkdir -p "$config_dir" || exit 1
-    download_dir=$(mktemp -d "${config_dir}/.backhaul-download.XXXXXX") || exit 1
-    echo "Downloading Backhaul..."
+    download_dir=$(mktemp -d "${config_dir}/.bh-download.XXXXXX") || exit 1
+    echo "Downloading BH..."
 
-    if ! curl -fSL --retry 2 --max-time 30 -o "$download_dir/backhaul" "$download_url"; then
+    if ! curl -fSL --retry 2 --max-time 30 -o "$download_dir/bh" "$download_url"; then
         colorize red "Download failed."
         rm -rf "$download_dir"
         exit 1
     fi
 
-    if ! chmod +x "$download_dir/backhaul" || ! mv -f "$download_dir/backhaul" "${config_dir}/backhaul_premium"; then
-        colorize red "Backhaul installation failed."
+    # Keep the installed executable name used by existing tunnel services.
+    if ! chmod +x "$download_dir/bh" || ! mv -f "$download_dir/bh" "${config_dir}/backhaul_premium"; then
+        colorize red "BH installation failed."
         rm -rf "$download_dir"
         exit 1
     fi
     rm -rf "$download_dir"
-    colorize green "Backhaul installation completed."
+    colorize green "BH installation completed."
 }
 
 install_jq
-download_backhaul
+download_bh
 
 # ============================================================================
 # CONFIGURATION SECTIONS - MODULAR PROMPTING
@@ -411,7 +412,7 @@ prompt_tun_section() {
 
     colorize blue "━━━ TUN Configuration ━━━" bold
 
-    prompt_with_default "TUN Device Name" "backhaul" CONFIG[tun_name]
+    prompt_with_default "TUN Device Name" "bh" CONFIG[tun_name]
 
     # Local and Remote addresses with CIDR validation
     # Server: local=10.10.10.3/24, remote=10.10.10.4/24
@@ -474,7 +475,7 @@ prompt_tls_section() {
     # Generate cert/key if missing
     if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
         colorize red "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
-        openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out  "$CERT_FILE" -subj "/CN=backhaul.com"
+        openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out  "$CERT_FILE" -subj "/CN=bh.local"
         colorize green "[*] Generated $CERT_FILE and $KEY_FILE"
         echo
     fi
@@ -569,8 +570,15 @@ prompt_ports_section() {
 
     else
         colorize blue "━━━ Port Mapping Configuration (tun helper) ━━━" bold
-        colorize magenta "Forwarder: use 'bbackhaul' for TCP support only, or 'iptables' for TCP + UDP support"
-        prompt_with_default "Forwarder (backhaul/iptables)" "backhaul" CONFIG[forwarder]
+        colorize magenta "Forwarder: use 'BH' for TCP support only, or 'iptables' for TCP + UDP support"
+        while true; do
+            prompt_with_default "Forwarder (BH/iptables)" "BH" CONFIG[forwarder]
+            case "${CONFIG[forwarder],,}" in
+                bh|backhaul) CONFIG[forwarder]=backhaul; break ;;
+                iptables) CONFIG[forwarder]=iptables; break ;;
+                *) colorize red 'Choose BH or iptables.' ;;
+            esac
+        done
         echo ""
         colorize green "Supported formats:"
         echo "  1. 443           - Listen on 443, forward to 443"
@@ -1010,6 +1018,17 @@ edit_value() {
     return 0
 }
 
+# Display the engine's forwarder enum under the public product name.
+edit_display_value() {
+    local value
+    value=$(edit_value "$@")
+    if [[ "$1" == ports.forwarder && "$value" == backhaul ]]; then
+        printf BH
+    else
+        printf '%s' "$value"
+    fi
+}
+
 # Fields are listed in menu order with defaults for settings absent from a file.
 edit_fields() {
     case "$1" in
@@ -1039,7 +1058,7 @@ EOF
             ;;
         tun)
             echo 'encapsulation|"tcp"'
-            echo 'name|"backhaul"'
+            echo 'name|"bh"'
             if [[ "$edit_mode" == server ]]; then
                 echo 'local_addr|"10.10.10.1/24"'; echo 'remote_addr|"10.10.10.2/24"'
             else
@@ -1171,7 +1190,7 @@ edit_choices() {
         tuning.tuning_profile) echo 'balanced fast latency resource' ;;
         tuning.buffer_profile) echo 'extreme_low_cpu ultra_low_cpu low_cpu balanced low_memory' ;;
         logging.log_level) echo 'panic fatal error warn info debug trace' ;;
-        ports.forwarder) echo 'backhaul iptables' ;;
+        ports.forwarder) echo 'BH iptables' ;;
         mux.mux_version) echo '1 2' ;;
     esac
 }
@@ -1204,7 +1223,7 @@ edit_valid_mappings() {
 edit_prompt_field() {
     local id="$1" default="$2" current type input encoded choices i
     local -a options
-    current=$(edit_value "$id" "$default")
+    current=$(edit_display_value "$id" "$default")
     type=$(printf '%s' "${EDIT_VALUES[$id]:-$default}" | jq -r type)
     choices=$(edit_choices "$id")
     echo
@@ -1273,7 +1292,9 @@ edit_prompt_field() {
                 fi
                 encoded=$(jq -cn --arg value "$input" '$value | split(",") | map(select(length > 0))')
                 ;;
-            string) encoded=$(jq -cn --arg value "$input" '$value') ;;
+            string)
+                [[ "$id" == ports.forwarder && "$input" == BH ]] && input=backhaul
+                encoded=$(jq -cn --arg value "$input" '$value') ;;
             *) colorize red 'Unsupported setting type.'; return 1 ;;
         esac
         EDIT_VALUES[$id]="$encoded"
@@ -1374,7 +1395,7 @@ edit_section_menu() {
             keys+=("$key"); defaults+=("${EDIT_VALUES[$id]}")
         done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
         for i in "${!keys[@]}"; do
-            printf ' %s) %s: %s\n' "$((i+1))" "$(edit_label "${keys[$i]}")" "$(edit_value "$section.${keys[$i]}" "${defaults[$i]}")"
+            printf ' %s) %s: %s\n' "$((i+1))" "$(edit_label "${keys[$i]}")" "$(edit_display_value "$section.${keys[$i]}" "${defaults[$i]}")"
         done
         echo ' 0) Back'
         read -r -p 'Select a setting to change: ' choice || return 1
@@ -1414,7 +1435,7 @@ edit_save_config() {
         if [[ "$cert" == "$CERT_FILE" && "$key" == "$KEY_FILE" && ( ! -f "$cert" || ! -f "$key" ) ]]; then
             colorize yellow 'Generating the default TLS certificate and key...'
             openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 \
-                -keyout "$key" -out "$cert" -subj '/CN=backhaul.com' || return 1
+                -keyout "$key" -out "$cert" -subj '/CN=bh.local' || return 1
         fi
         if [[ ! -f "$cert" || ! -f "$key" ]]; then
             colorize red 'TLS certificate/key not found. Set valid paths before saving.'
@@ -1454,7 +1475,7 @@ edit_tunnel() {
             section="${EDIT_SECTIONS[$i]}"
             printf ' %s) %s\n' "$((i+1))" "$(edit_label "$section")"
             while IFS= read -r id; do
-                [[ "$id" == "$section."* ]] && printf '    %s: %s\n' "$(edit_label "${id#*.}")" "$(edit_value "$id")"
+                [[ "$id" == "$section."* ]] && printf '    %s: %s\n' "$(edit_label "${id#*.}")" "$(edit_display_value "$id")"
             done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
         done
         echo ' s) Save changes and restart tunnel'
@@ -1488,7 +1509,7 @@ create_systemd_service() {
 
     cat > "$service_file" <<EOF
 [Unit]
-Description=Backhaul $desc_type Port $port
+Description=BH $desc_type Port $port
 After=network.target
 
 [Service]
@@ -1509,11 +1530,11 @@ EOF
 
     if ! systemctl daemon-reload || ! systemctl enable --now "backhaul-${type}${port}.service" ||
        ! sleep 1 || ! systemctl is-active --quiet "backhaul-${type}${port}.service"; then
-        colorize red "Service backhaul-${type}${port} failed to start. Check its service logs."
+        colorize red "BH service ${type}${port} failed to start. Check its service logs."
         return 1
     fi
 
-    colorize green "✔ Service backhaul-${type}${port} created and started" bold
+    colorize green "✔ BH service ${type}${port} created and started" bold
 }
 
 # ============================================================================
@@ -1536,18 +1557,22 @@ settings_json() {
     } | jq -cS .
 }
 
-encode_backhaul_link() {
+encode_bh_link() {
     local scheme="$1" body="$2"
     printf '%s://1.' "$scheme"
     printf '%s' "$body" | base64 | tr -d '\n=' | tr '+/' '-_'
     echo
 }
 
-decode_backhaul_link() {
+decode_bh_link() {
     local scheme="$1" raw="$2" payload decoded
     # No fetching URLs or evaluating shell text; a link holds data only.
     raw=$(edit_trim "$raw")
     raw="${raw#\'}"; raw="${raw%\'}"; raw="${raw#\"}"; raw="${raw%\"}"
+    # Accept setup/test links issued by previous installations.
+    if [[ "$raw" == "backhaul${scheme#bh}://1."* ]]; then
+        raw="$scheme://1.${raw#*://1.}"
+    fi
     if [[ ${#raw} -gt 32768 || "$raw" != "$scheme://1."* ]]; then
         colorize red "Expected a $scheme://1. link (maximum 32 KiB)." >&2
         return 1
@@ -1628,7 +1653,7 @@ peer_setup_link() {
     for id in "${!EDIT_VALUES[@]}"; do
         [[ -n "${allowed[$id]}" ]] || unset 'EDIT_VALUES[$id]'
     done
-    encode_backhaul_link backhaul "$(settings_json | jq -c '{v:1,kind:"setup",role:"client",settings:.}')"
+    encode_bh_link bh "$(settings_json | jq -c '{v:1,kind:"setup",role:"client",settings:.}')"
 }
 
 validate_setup_settings() {
@@ -1656,6 +1681,7 @@ validate_setup_settings() {
             printf '%s' "${EDIT_VALUES[$id]}" | jq -e '. >= 0 and . <= 2147483647 and floor == .' >/dev/null || return 1
         fi
         choices=$(edit_choices "$id")
+        [[ "$id" == ports.forwarder && "$value" == backhaul ]] && value=BH
         [[ -z "$choices" || " $choices " == *" $value "* ]] || { colorize red "Invalid choice: $id"; return 1; }
     done
     if [[ "$(edit_value tun.encapsulation)" != ipx ]]; then
@@ -1688,7 +1714,7 @@ validate_setup_settings() {
 
 load_setup_link() {
     local raw="$1" json id value
-    json=$(decode_backhaul_link backhaul "$raw") || return 1
+    json=$(decode_bh_link bh "$raw") || return 1
     printf '%s' "$json" | jq -e '
         .kind == "setup" and .role == "client" and (.settings | type == "object") and
         (.settings | length > 0 and length <= 100) and
@@ -1773,7 +1799,7 @@ install_link_settings() {
 
 setup_from_link() {
     local raw
-    echo 'Paste the backhaul://1. link generated on your IRAN server.'
+    echo 'Paste the bh://1. link generated on your IRAN server.'
     read -r -p 'Setup link (blank to cancel): ' raw || return 1
     [[ -n "$raw" ]] || return 0
     load_setup_link "$raw" && install_link_settings
@@ -1788,7 +1814,7 @@ show_setup_link() {
 }
 
 # Python is needed only for diagnostics, keeping socket timeouts and exact
-# byte comparisons portable. It starts no Backhaul processes or systemd units.
+# byte comparisons portable. It starts no BH processes or systemd units.
 connection_tool() {
     command -v python3 >/dev/null || {
         colorize red 'Diagnostics require python3. Install it with: apt-get install -y python3' >&2
@@ -1977,7 +2003,7 @@ CONNECT_WAIT = 30
 JOIN_WAIT = 600
 ACK_WAIT = 30
 MAX_MESSAGE = 65536
-SCHEME = 'backhaul-compare://1.'
+SCHEME = 'bh-compare://1.'
 
 def emit(message):
     print(message, flush=True)
@@ -2046,8 +2072,10 @@ def encode_link(value):
 
 def decode_link(raw):
     raw = raw.strip().strip('\"\'')
+    if raw.startswith('backhaul-compare://1.'):
+        raw = SCHEME + raw.split('://1.', 1)[1]
     if not raw.startswith(SCHEME) or len(raw) > 4096:
-        raise ValueError('paste the complete backhaul-compare://1. link from IRAN')
+        raise ValueError('paste the complete bh-compare://1. link from IRAN')
     payload = raw[len(SCHEME):]
     if not re.fullmatch('[A-Za-z0-9_-]+', payload):
         raise ValueError('invalid comparison link encoding')
@@ -2115,7 +2143,7 @@ class PausedServices:
             result = run_command(['systemctl', 'list-units', '--type=service', '--state=active,activating,reloading',
                                   '--plain', '--no-legend', 'backhaul-*.service'])
             if result.returncode:
-                raise ValueError('could not list running Backhaul services; no test engine was started')
+                raise ValueError('could not list running BH services; no test engine was started')
             self.units = [line.split()[0] for line in result.stdout.splitlines() if line.split() and
                           re.fullmatch(r'backhaul-(?:iran|kharej)[0-9]+\.service', line.split()[0])]
             for unit in self.units:
@@ -2123,7 +2151,7 @@ class PausedServices:
                 if run_command(['systemctl', 'stop', unit]).returncode:
                     raise ValueError('could not pause ' + unit)
             if self.other_cores():
-                raise ValueError('another Backhaul core is running outside the managed services; stop it before comparing')
+                raise ValueError('another BH core is running outside the managed services; stop it before comparing')
             return self
         except BaseException:
             self.restore()
@@ -2187,7 +2215,7 @@ def render_config(side, case, link, entry, backend, interface, net, cert, key):
         section['mux'] = {'mux_version': 2, 'mux_framesize': 32768, 'mux_recievebuffer': 4194304,
                           'mux_streambuffer': 2097152, 'mux_concurrency': 8}
     if case in ('wss', 'wssmux', 'anytls'):
-        section['tls'] = {'sni': 'backhaul.com'}
+        section['tls'] = {'sni': 'bh.local'}
         if side == 'iran':
             section['tls'].update(tls_cert=str(cert), tls_key=str(key))
     # Diagnostic engines must not tune global kernel settings or add iptables forwarding rules.
@@ -2229,7 +2257,7 @@ class Engine:
 
     def check(self):
         if self.process is not None and self.process.poll() is not None:
-            raise ValueError(f'Backhaul core exited with status {self.process.returncode}')
+            raise ValueError(f'BH core exited with status {self.process.returncode}')
 
     def stop(self):
         if self.process is not None:
@@ -2572,7 +2600,7 @@ def server(directory, host, coord_port, tunnel_port, mode):
             tls_error = ''
             try:
                 result = run_command(['openssl', 'req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
-                                      '-nodes', '-x509', '-days', '1', '-sha256', '-keyout', str(key), '-out', str(cert), '-subj', '/CN=backhaul.com'])
+                                      '-nodes', '-x509', '-days', '1', '-sha256', '-keyout', str(key), '-out', str(cert), '-subj', '/CN=bh.local'])
                 if result.returncode:
                     tls_error = 'could not create temporary TLS certificate'
             except (OSError, subprocess.SubprocessError):
@@ -2595,7 +2623,7 @@ def server(directory, host, coord_port, tunnel_port, mode):
                         row = {'transport': case, 'status': 'SKIPPED', 'detail': problem}
                     else:
                         if paused.other_cores():
-                            raise ValueError('another Backhaul core started during the comparison; stopping')
+                            raise ValueError('another BH core started during the comparison; stopping')
                         config = render_config('iran', case, link, entry, peer['backend'], engine.interface, peer['net'], cert, key)
                         try:
                             engine.start(config, case.startswith('tun/'))
@@ -2673,7 +2701,7 @@ def client(directory, raw):
                     error = ''
                     try:
                         if paused.other_cores():
-                            raise ValueError('another Backhaul core is running here')
+                            raise ValueError('another BH core is running here')
                         if '/ipx/' in case and net['ipx_error']:
                             raise ValueError(net['ipx_error'])
                         config = render_config('kharej', case, link, state['entry'], echo.port, engine.interface, net, '', '')
@@ -2722,7 +2750,7 @@ def main():
     if sys.version_info < (3, 9):
         raise ValueError('transport comparison requires Python 3.9 or newer')
     if not os.access(Path(directory) / 'backhaul_premium', os.X_OK):
-        raise ValueError('install the Backhaul core first')
+        raise ValueError('install the BH core first')
     with open(Path(directory) / '.connection-test.lock', 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2757,7 +2785,7 @@ PY_COMPARE
 
 test_all_transports_menu() {
     local role host coord port plan raw confirm
-    [[ -x "$config_dir/backhaul_premium" ]] || { colorize red 'Install Backhaul Core first.'; press_key; return 1; }
+    [[ -x "$config_dir/backhaul_premium" ]] || { colorize red 'Install BH Core first.'; press_key; return 1; }
     colorize cyan 'Compare all transports — ping and speed (sequential)' bold
     echo '1) IRAN — start here and get a test link'
     echo '2) KHAREJ — paste the IRAN test link'
@@ -2784,13 +2812,13 @@ test_all_transports_menu() {
             echo "Allow TCP $coord and $port from KHAREJ to IRAN before starting. IPX also depends on its raw protocol path."
             ;;
         2)
-            read -r -p 'Paste the backhaul-compare://1. link from IRAN: ' raw || return 1
+            read -r -p 'Paste the bh-compare://1. link from IRAN: ' raw || return 1
             ;;
         *) colorize red 'Invalid role.'; return 1 ;;
     esac
-    colorize yellow 'This comparison temporarily pauses running managed Backhaul tunnels on this server.'
+    colorize yellow 'This comparison temporarily pauses running managed BH tunnels on this server.'
     echo 'Their configurations and boot settings are preserved. Paused services are restored after the test or Ctrl+C.'
-    echo 'The test starts only one temporary Backhaul core at a time. Unmanaged cores must be stopped first.'
+    echo 'The test starts only one temporary BH core at a time. Unmanaged cores must be stopped first.'
     read -r -p 'Continue with the temporary pause? [y/N]: ' confirm || return 1
     [[ "$confirm" == y || "$confirm" == Y ]] || return 0
     if [[ "$role" == 1 ]]; then
@@ -2868,7 +2896,7 @@ prepare_traffic_test() {
     [[ "$(edit_value transport.type)" == tun ]] && host="$(edit_value tun.remote_addr)" && host="${host%/*}"
     nonce=$(random_secret)
     fingerprint=$(pair_fingerprint) || return 1
-    link=$(encode_backhaul_link backhaul-test "$(jq -cn --arg host "$host" --argjson port "$((10#$backend))" \
+    link=$(encode_bh_link bh-test "$(jq -cn --arg host "$host" --argjson port "$((10#$backend))" \
         --arg secret "$nonce" --arg pair "$fingerprint" '{v:1,kind:"traffic-test",host:$host,port:$port,secret:$secret,pair:$pair}')")
     echo 'On KHAREJ: select the matching tunnel → Test connection → Start responder → paste this link:'
     echo "$link"
@@ -2886,8 +2914,8 @@ prepare_traffic_test() {
 start_traffic_responder() {
     local file="$1" raw json host port secret pair expected_host
     [[ "$(basename "$file")" == kharej*.toml ]] || { colorize red 'Run the responder on KHAREJ.'; return 1; }
-    read -r -p 'Paste the backhaul-test://1. link from IRAN: ' raw || return 1
-    json=$(decode_backhaul_link backhaul-test "$raw") || return 1
+    read -r -p 'Paste the bh-test://1. link from IRAN: ' raw || return 1
+    json=$(decode_bh_link bh-test "$raw") || return 1
     printf '%s' "$json" | jq -e '.kind == "traffic-test" and (.host | type == "string") and
         (.port | type == "number" and . >= 1 and . <= 65535 and floor == .) and
         (.secret | type == "string" and test("^[a-f0-9]{64}$")) and
@@ -2994,17 +3022,18 @@ SERVER_ISP=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/n
 display_logo() {
     echo -e "\033[36m"
     cat << "EOF"
-▗▄▄▖  ▗▄▖  ▗▄▄▖▗▖ ▗▖▗▖ ▗▖ ▗▄▖ ▗▖ ▗▖▗▖
-▐▌ ▐▌▐▌ ▐▌▐▌   ▐▌▗▞▘▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌
-▐▛▀▚▖▐▛▀▜▌▐▌   ▐▛▚▖ ▐▛▀▜▌▐▛▀▜▌▐▌ ▐▌▐▌
-▐▙▄▞▘▐▌ ▐▌▝▚▄▄▖▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▝▚▄▞▘▐▙▄▄▖
+ ____  _   _
+| __ )| | | |
+|  _ \| |_| |
+| |_) |  _  |
+|____/|_| |_|
 
-Lightning-fast reverse tunneling solution
+Reverse tunneling manager
 EOF
     echo -e "\033[0m\033[32m"
     echo -e "Script Version: \033[33m${SCRIPT_VERSION}\033[32m"
     [[ -f "${config_dir}/backhaul_premium" ]] && \
-        echo -e "Core Version: \033[33m$($config_dir/backhaul_premium -v)\033[32m"
+        echo -e "Core Version: \033[33m$("$config_dir/backhaul_premium" -v | sed 's/[Bb]ackhaul/BH/g')\033[32m"
 }
 
 display_server_info() {
@@ -3014,11 +3043,11 @@ display_server_info() {
     echo -e "\033[36mDatacenter:\033[0m $SERVER_ISP"
 }
 
-display_backhaul_core_status() {
+display_bh_core_status() {
     if [[ -f "${config_dir}/backhaul_premium" ]]; then
-        echo -e "\033[36mBackhaul Core:\033[0m \033[32mInstalled\033[0m"
+        echo -e "\033[36mBH Core:\033[0m \033[32mInstalled\033[0m"
     else
-        echo -e "\033[36mBackhaul Core:\033[0m \033[31mNot installed\033[0m"
+        echo -e "\033[36mBH Core:\033[0m \033[31mNot installed\033[0m"
     fi
     echo -e "\e[93m═══════════════════════════════════════════\e[0m"
 }
@@ -3065,7 +3094,7 @@ check_config_backup() {
 
             cat > "$service_file" <<EOF
 [Unit]
-Description=Backhaul $desc_loc Port $tunnel_port
+Description=BH $desc_loc Port $tunnel_port
 After=network.target
 
 [Service]
@@ -3270,22 +3299,22 @@ remove_core() {
         return 1
     fi
 
-    colorize yellow "Remove Backhaul-Core? (y/n)"
+    colorize yellow "Remove BH-Core? (y/n)"
     read -r confirm
 
     if [[ $confirm == [yY] ]]; then
         [[ -d "$config_dir" ]] && rm -rf "$config_dir"
-        colorize green "Backhaul-Core removed." bold
+        colorize green "BH-Core removed." bold
     fi
     press_key
 }
 
 update_script() {
     local dest_dir="/usr/bin"
-    local script_url="https://raw.githubusercontent.com/MatinDehghanian/backhaul-script/refs/heads/main/backhaul.sh"
+    local script_url="https://raw.githubusercontent.com/MatinDehghanian/bh/refs/heads/main/bh.sh"
     local temporary
 
-    if ! temporary=$(mktemp "$dest_dir/.backhaul-script.XXXXXX"); then
+    if ! temporary=$(mktemp "$dest_dir/.bh-script.XXXXXX"); then
         colorize red "Could not prepare the script update."
         press_key
         return 1
@@ -3296,7 +3325,7 @@ update_script() {
         [[ "$(head -n 1 "$temporary")" != '#!/bin/bash' ]] ||
         ! bash -n "$temporary" ||
         ! chmod 755 "$temporary" ||
-        ! mv -fT -- "$temporary" "$dest_dir/backhaul"; then
+        ! mv -fT -- "$temporary" "$dest_dir/bh"; then
         rm -f "$temporary"
         colorize red "Script update failed. The installed script was kept."
         press_key
@@ -3304,13 +3333,13 @@ update_script() {
     fi
 
     colorize green "Script updated from GitHub." bold
-    colorize yellow "Type 'backhaul' to run the updated script." bold
+    colorize yellow "Type 'bh' to run the updated script." bold
     exit 0
 }
 
 configure_tunnel() {
     [[ ! -d "$config_dir" ]] && {
-        colorize red "Install Backhaul-Core first."
+        colorize red "Install BH-Core first."
         press_key
         return 1
     }
@@ -3339,15 +3368,15 @@ display_menu() {
     clear
     display_logo
     display_server_info
-    display_backhaul_core_status
+    display_bh_core_status
 
     echo
     colorize green " 1. Configure a new tunnel" bold
     colorize red " 2. Tunnel management" bold
     colorize cyan " 3. Check tunnel status" bold
-    echo " 4. Update Backhaul Core"
+    echo " 4. Update BH Core"
     echo " 5. Update script"
-    echo " 6. Remove Backhaul Core"
+    echo " 6. Remove BH Core"
     colorize cyan " 7. Test all transports (ping and speed)" bold
     echo " 0. Exit"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -3359,7 +3388,7 @@ read_option() {
         1) configure_tunnel ;;
         2) tunnel_management ;;
         3) check_tunnel_status ;;
-        4) download_backhaul "menu" ;;
+        4) download_bh "menu" ;;
         5) update_script ;;
         6) remove_core ;;
         7) test_all_transports_menu ;;

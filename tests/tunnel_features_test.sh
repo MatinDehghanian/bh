@@ -4,8 +4,8 @@ set -eo pipefail
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'test_status=$?; if ((test_status)); then tail -40 "$test_dir/output.log" >&2; fi; rm -rf "$test_dir"' EXIT
-source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/backhaul.sh" | sed '$d')
-source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/backhaul.sh" | sed '$d')
+source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/bh.sh" | sed '$d')
+source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/bh.sh" | sed '$d')
 config_dir="$test_dir/configs"
 service_dir="$test_dir/services"
 CERT_DIR="$test_dir/certs"
@@ -70,9 +70,9 @@ assert_value ipx.mode client
 assert_value ipx.listen_ip 192.0.2.2
 assert_value ipx.dst_ip 192.0.2.1
 [[ -z "${EDIT_VALUES[ipx.interface]+present}" ]] || fail 'host-local interface should be requested on KHAREJ'
-bad=$(decode_backhaul_link backhaul "$link" | jq -c '.settings["security.psk"] += "!"')
+bad=$(decode_bh_link bh "$link" | jq -c '.settings["security.psk"] += "!"')
 set +o pipefail
-if load_setup_link "$(encode_backhaul_link backhaul "$bad")" > "$test_dir/output.log" 2>&1; then fail 'invalid PSK accepted without pipefail'; fi
+if load_setup_link "$(encode_bh_link bh "$bad")" > "$test_dir/output.log" 2>&1; then fail 'invalid PSK accepted without pipefail'; fi
 set -o pipefail
 load_setup_link "$link"
 install_link_settings > "$test_dir/output.log" <<'EOF'
@@ -109,12 +109,12 @@ cp "$config_dir/kharej8443.toml" "$test_dir/before.toml"
 load_setup_link "$link"
 install_link_settings <<< n > "$test_dir/output.log"
 cmp "$test_dir/before.toml" "$config_dir/kharej8443.toml"
-bad=$(decode_backhaul_link backhaul "$link" | jq -c '.settings["transport.connection_pool"]="oops"')
-if load_setup_link "$(encode_backhaul_link backhaul "$bad")" > "$test_dir/output.log" 2>&1; then fail 'wrong types accepted'; fi
-bad=$(decode_backhaul_link backhaul "$link" | jq -c '.settings["listener.bind_addr"]="$(not_a_command)"')
-if load_setup_link "$(encode_backhaul_link backhaul "$bad")" > "$test_dir/output.log" 2>&1; then fail 'unexpected fields accepted'; fi
+bad=$(decode_bh_link bh "$link" | jq -c '.settings["transport.connection_pool"]="oops"')
+if load_setup_link "$(encode_bh_link bh "$bad")" > "$test_dir/output.log" 2>&1; then fail 'wrong types accepted'; fi
+bad=$(decode_bh_link bh "$link" | jq -c '.settings["listener.bind_addr"]="$(not_a_command)"')
+if load_setup_link "$(encode_bh_link bh "$bad")" > "$test_dir/output.log" 2>&1; then fail 'unexpected fields accepted'; fi
 if load_setup_link 'backpack://2.not-compatible' > "$test_dir/output.log" 2>&1; then fail 'wrong scheme accepted'; fi
-if load_setup_link 'backhaul://1.bad!' > "$test_dir/output.log" 2>&1; then fail 'bad encoding accepted'; fi
+if load_setup_link 'bh://1.bad!' > "$test_dir/output.log" 2>&1; then fail 'bad encoding accepted'; fi
 cmp "$test_dir/before.toml" "$config_dir/kharej8443.toml"
 echo 'PASS: cancellation, malformed links, unknown fields and wrong types leave files untouched'
 
@@ -160,8 +160,8 @@ prepare_traffic_test "$config_dir/iran8443.toml" > "$test_dir/output.log" <<'EOF
 5003
 
 EOF
-test_link=$(sed -n '/^backhaul-test:\/\//p' "$test_dir/output.log")
-json=$(decode_backhaul_link backhaul-test "$test_link")
+test_link=$(sed -n '/^bh-test:\/\//p' "$test_dir/output.log")
+json=$(decode_bh_link bh-test "$test_link")
 [[ "$(printf '%s' "$json" | jq -r .port)" == 5201 ]] || fail 'range backend mapping incorrect'
 grep -q '^traffic 127.0.0.1 5003 ' "$test_dir/probes.log" || fail 'wrong mapping was tested'
 [[ "$(wc -l < "$test_dir/probes.log" | tr -d ' ')" == 1 ]] || fail 'more than one test ran'

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Configuration-only checks: no Backhaul process, service or network changes.
+# Configuration-only checks: no BH process, service or network changes.
 set -eo pipefail
 ((BASH_VERSINFO[0] >= 4)) || { echo 'Bash 4+ required'; exit 1; }
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
-source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/backhaul.sh" | sed '$d')
-source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/backhaul.sh" | sed '$d')
+source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/bh.sh" | sed '$d')
+source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/bh.sh" | sed '$d')
 SERVER_IP=192.0.2.1
 colorize() { :; }
 ip() { echo 'default via 192.0.2.254 dev eth0'; }

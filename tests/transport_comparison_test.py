@@ -1,6 +1,6 @@
 """Verify embedded transport comparison with loopback relays and simulated services.
 
-No Linux Backhaul binary, systemd service, firewall or TUN device is touched.
+No Linux BH binary, systemd service, firewall or TUN device is touched.
 Python 3.11+ is used to independently parse every generated TOML configuration.
 """
 import contextlib
@@ -21,11 +21,11 @@ from unittest import mock
 
 
 def load_helper():
-    source = (Path(__file__).resolve().parents[1] / 'backhaul.sh').read_text()
+    source = (Path(__file__).resolve().parents[1] / 'bh.sh').read_text()
     start = source.index("<<'PY_COMPARE'\n") + len("<<'PY_COMPARE'\n")
     end = source.index('\nPY_COMPARE\n', start)
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader('comparison', loader=None))
-    exec(compile(source[start:end], 'backhaul.sh:PY_COMPARE', 'exec'), module.__dict__)
+    exec(compile(source[start:end], 'bh.sh:PY_COMPARE', 'exec'), module.__dict__)
     return module
 
 
@@ -92,6 +92,8 @@ class ComparisonTests(unittest.TestCase):
 
     def test_link_validation_and_authenticated_messages(self):
         self.assertEqual(self.helper.decode_link(self.helper.encode_link(self.link)), self.link)
+        legacy = self.helper.encode_link(self.link).replace('bh-compare://', 'backhaul-compare://', 1)
+        self.assertEqual(self.helper.decode_link(legacy), self.link)
         for field, value in [('port', 0), ('coord', True), ('secret', 'weak'), ('block', '10.0.0.0/30'),
                              ('until', int(time.time()) - 1), ('host', 'host\n$(command)'), ('mode', 'bad')]:
             with self.assertRaises((ValueError, TypeError)):

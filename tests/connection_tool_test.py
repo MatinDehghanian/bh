@@ -1,6 +1,6 @@
 """Exercise the real embedded socket helper on loopback; needs Bash 4+ and Python 3.
 
-Runs a full 60-second echo soak. No Backhaul process, service or external host is used.
+Runs a full 60-second echo soak. No BH process, service or external host is used.
 """
 import os
 from pathlib import Path
@@ -26,7 +26,7 @@ class ConnectionTests(unittest.TestCase):
         cls.server = cls.root / "kharej"
         cls.client.mkdir()
         cls.server.mkdir()
-        source = (Path(__file__).resolve().parents[1] / "backhaul.sh").read_text()
+        source = (Path(__file__).resolve().parents[1] / "bh.sh").read_text()
         start = source.index("connection_tool() {")
         end = source.index("\npair_fingerprint()", start)
         cls.wrapper = cls.root / "tool.sh"
