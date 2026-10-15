@@ -2921,7 +2921,7 @@ def server(directory, host, coord_port, tunnel_port, mode):
     binary = str(Path(directory) / 'backhaul_premium')
     try:
         emit('IRAN test link (keep private):\n' + encode_link(link))
-        emit(f'On KHAREJ: main menu → 7 → KHAREJ → paste the link. Allow TCP {coord_port} and {tunnel_port} to IRAN.')
+        emit(f'On KHAREJ: main menu → 4 → KHAREJ → paste the link. Allow TCP {coord_port} and {tunnel_port} to IRAN.')
         emit('Waiting up to 10 minutes for KHAREJ. Existing services are paused only after it joins.')
         wait_for(coordinator.joined, JOIN_WAIT, coordinator)
         peer = coordinator.state['peer']
@@ -3271,14 +3271,19 @@ test_connection_menu() {
         if [[ "$(basename "$file")" == iran* ]]; then
             ui_item 2 'Real traffic test · select a mapping & get a test link'
         else
-            ui_item 3 'Start responder · paste the IRAN test link'
+            ui_item 2 'Start responder · paste the IRAN test link'
         fi
         ui_item 0 'Back'
         read -r -p 'Choose one test: ' choice || return 1
         case "$choice" in
             1) quick_connection_test "$file"; press_key ;;
-            2) prepare_traffic_test "$file"; press_key ;;
-            3) start_traffic_responder "$file"; press_key ;;
+            2)
+                if [[ "$(basename "$file")" == iran* ]]; then
+                    prepare_traffic_test "$file"
+                else
+                    start_traffic_responder "$file"
+                fi
+                press_key ;;
             0) return 0 ;;
             *) colorize red 'Invalid option.' ;;
         esac
@@ -3406,7 +3411,7 @@ display_bh_core_status() {
         if [[ "$state" == active ]]; then ((running+=1)); else ((attention+=1)); fi
     done
     if [[ -x "$config_dir/backhaul_premium" ]]; then colorize green '  Core     Installed';
-    else colorize yellow '  Core     Not installed · choose 1 or 4 to install'; fi
+    else colorize yellow '  Core     Not installed · choose 1 or 5 to install'; fi
     printf '  Tunnels  %s total  /  %s running  /  %s need attention\n' "${#TUNNEL_FILES[@]}" "$running" "$attention"
     ui_rule
 }
@@ -3455,7 +3460,8 @@ check_tunnel_status() {
 }
 
 tunnel_management() {
-    local choice selected_config config_name service_name state
+    local choice selected_config config_name service_name state index action repair_choice
+    local -a entries
     while true; do
         collect_tunnels
         ui_header 'MY TUNNELS' 'Select a tunnel to see its settings and actions.'
@@ -3464,13 +3470,15 @@ tunnel_management() {
         fi
         show_tunnel_rows
         ui_section 'TOOLS'
-        ui_item r 'Repair missing services'
+        repair_choice=$((${#TUNNEL_FILES[@]}+1))
+        ui_item "$repair_choice" 'Repair missing services'
         ui_item 0 'Back to home'
         ui_read_choice choice || return 0
         case "$choice" in
             0|q|Q) return 0 ;;
             r|R) check_config_backup; continue ;;
         esac
+        if [[ "$choice" == "$repair_choice" ]]; then check_config_backup; continue; fi
         if [[ ! "$choice" =~ ^[0-9]{1,3}$ ]] || ((10#$choice < 1 || 10#$choice > ${#TUNNEL_FILES[@]})); then
             colorize red 'Choose one of the listed tunnels.'; press_key; continue
         fi
@@ -3482,33 +3490,44 @@ tunnel_management() {
             state=$(tunnel_state "$selected_config")
             ui_header "$config_name" "Service: $state"
             if edit_load_config "$selected_config"; then show_config_summary; fi
-            ui_section 'CONFIGURE & VERIFY'
-            ui_item 1 'Edit settings'
-            ui_item 2 'Test connection'
-            [[ "$config_name" == iran* ]] && ui_item 3 'Copy KHAREJ setup link'
-            ui_item 4 'Health check & file locations'
-            ui_section 'SERVICE'
-            ui_item 5 'Restart tunnel'
-            [[ "$state" == active ]] && ui_item 6 'Stop tunnel' || ui_item 6 'Start tunnel'
-            ui_item 7 'Recent logs'
-            ui_item 8 'Service details'
-            [[ -f "$selected_config.bak" ]] && ui_item 9 'Restore previous settings'
-            ui_item d 'Delete this tunnel'
+            entries=('edit|Edit settings' 'test|Test connection')
+            [[ "$config_name" == iran* ]] && entries+=('link|Copy KHAREJ setup link')
+            entries+=('health|Health check & file locations' 'restart|Restart tunnel')
+            if [[ "$state" == active ]]; then entries+=('toggle|Stop tunnel');
+            else entries+=('toggle|Start tunnel'); fi
+            entries+=('logs|Recent logs' 'status|Service details')
+            [[ -f "$selected_config.bak" ]] && entries+=('restore|Restore previous settings')
+            entries+=('delete|Delete this tunnel')
+            for index in "${!entries[@]}"; do
+                action="${entries[$index]%%|*}"
+                case "$action" in
+                    edit) ui_section 'CONFIGURE & VERIFY' ;;
+                    restart) ui_section 'SERVICE' ;;
+                esac
+                ui_item "$((index+1))" "${entries[$index]#*|}"
+            done
             ui_item 0 'Back to tunnel list'
             ui_read_choice choice || return 0
             case "$choice" in
                 0|q|Q) break ;;
-                1) edit_tunnel "$selected_config" ;;
-                2) test_connection_menu "$selected_config" ;;
-                3) if [[ "$config_name" == iran* ]]; then show_setup_link "$selected_config"; fi ;;
-                4) tunnel_health_check "$selected_config" ;;
-                5) restart_service "$service_name" ;;
-                6) toggle_tunnel_service "$service_name" ;;
-                7) view_service_logs "$service_name" ;;
-                8) view_service_status "$service_name" ;;
-                9) restore_tunnel_backup "$selected_config" ;;
-                d|D) destroy_tunnel "$selected_config" ;;
-                *) colorize red 'Choose one of the listed actions.'; press_key ;;
+                d|D) action=delete ;;
+                *)
+                    if [[ ! "$choice" =~ ^[0-9]{1,3}$ ]] || ((10#$choice < 1 || 10#$choice > ${#entries[@]})); then
+                        colorize red 'Choose one of the listed actions.'; press_key; continue
+                    fi
+                    action="${entries[$((10#$choice-1))]%%|*}" ;;
+            esac
+            case "$action" in
+                edit) edit_tunnel "$selected_config" ;;
+                test) test_connection_menu "$selected_config" ;;
+                link) show_setup_link "$selected_config" ;;
+                health) tunnel_health_check "$selected_config" ;;
+                restart) restart_service "$service_name" ;;
+                toggle) toggle_tunnel_service "$service_name" ;;
+                logs) view_service_logs "$service_name" ;;
+                status) view_service_status "$service_name" ;;
+                restore) restore_tunnel_backup "$selected_config" ;;
+                delete) destroy_tunnel "$selected_config" ;;
             esac
         done
     done
@@ -3650,11 +3669,11 @@ display_menu() {
     ui_item 1 'New tunnel'
     ui_item 2 'My tunnels · edit, test, logs & services'
     ui_item 3 'Tunnel status'
-    ui_item 7 'Compare transports · ping & speed'
+    ui_item 4 'Compare transports · ping & speed'
     ui_section 'MAINTENANCE'
-    ui_item 4 'Install / update BH Core'
-    ui_item 5 'Update this script'
-    ui_item 6 'Remove BH Core'
+    ui_item 5 'Install / update BH Core'
+    ui_item 6 'Update this script'
+    ui_item 7 'Remove BH Core'
     ui_rule
     ui_item 0 'Exit'
 }
@@ -3666,10 +3685,10 @@ read_option() {
         1) configure_tunnel ;;
         2) tunnel_management ;;
         3) check_tunnel_status ;;
-        4) download_bh menu; press_key ;;
-        5) update_script ;;
-        6) remove_core ;;
-        7) test_all_transports_menu ;;
+        4) test_all_transports_menu ;;
+        5) download_bh menu; press_key ;;
+        6) update_script ;;
+        7) remove_core ;;
         0|q|Q) return 2 ;;
         *) colorize red 'Choose an option from 0 to 7.'; press_key ;;
     esac

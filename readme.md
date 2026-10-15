@@ -33,7 +33,7 @@ chmod +x bh.sh
 sudo ./bh.sh
 ```
 
-When you first create a tunnel (or choose **4. Install / update BH Core**), the script downloads the executable from:
+When you first create a tunnel (or choose **5. Install / update BH Core**), the script downloads the executable from:
 
 ```text
 https://raw.githubusercontent.com/MatinDehghanian/bh/refs/heads/main/bh
@@ -57,7 +57,7 @@ The script offers `tcp`, `tcpmux`, `xtcpmux`, `ws`, `wss`, `wsmux`, `wssmux`, `x
 
 The home screen shows the local server address, core installation state, and counts of running tunnels and tunnels needing attention. **My tunnels** shows active, inactive, failed, and missing-service states. A repair action recreates missing services after confirmation.
 
-Menus stay open after actions; **0** goes back and **q** exits the home screen. Press Enter to keep a default, type `/cancel` at setup prompts to return, or use Ctrl+D to leave input. Boolean prompts accept `y`/`n` and `true`/`false`. Tokens and PSKs are hidden in settings summaries. Logs show the last 60 lines without trapping navigation in a live stream.
+Options are numbered consecutively from top to bottom, including when some actions are hidden for the selected server. Menus stay open after actions; **0** goes back and **q** exits the home screen. Press Enter to keep a default, type `/cancel` at setup prompts to return, or use Ctrl+D to leave input. Boolean prompts accept `y`/`n` and `true`/`false`. Tokens and PSKs are hidden in settings summaries. Logs show the last 60 lines without trapping navigation in a live stream.
 
 Colors are enabled on capable terminals. Redirected output is plain text; `NO_COLOR=1` or `--no-color` disables colors. Help and version work without root, downloads or systemd:
 
@@ -76,17 +76,17 @@ Opening the manager does not download the core or query third-party geolocation 
 | 1. New tunnel | Create a server or client tunnel and its systemd service. |
 | 2. My tunnels | Edit, test connectivity, export setup links, check health, start/stop, restore the previous config, inspect logs, or delete a tunnel. |
 | 3. Tunnel status | Check configured tunnel services. |
-| 4. Install / update BH Core | Download the latest executable from this repository. Restart existing tunnel services afterward through tunnel management. |
-| 5. Update script | Download the latest script from this repository's GitHub raw URL, validate it, and install it as executable `/usr/bin/bh`. Run `bh` to reopen it. Failed updates keep the installed script. |
-| 6. Remove BH Core | Remove the core after deleting all tunnel services. |
-| 7. Compare transports | Compare transport availability between IRAN and KHAREJ, one temporary tunnel at a time, with ping, jitter, upload and download results. |
+| 4. Compare transports | Compare transport availability between IRAN and KHAREJ, one temporary tunnel at a time, with ping, jitter, upload and download results. |
+| 5. Install / update BH Core | Download the latest executable from this repository. Restart existing tunnel services afterward through tunnel management. |
+| 6. Update script | Download the latest script from this repository's GitHub raw URL, validate it, and install it as executable `/usr/bin/bh`. Run `bh` to reopen it. Failed updates keep the installed script. |
+| 7. Remove BH Core | Remove the core after deleting all tunnel services. |
 | 0. Exit | Close the menu. |
 
 ## File locations
 
 The manager keeps using the existing core/configuration directory and systemd service identifiers so updates continue managing installed tunnels. Server configurations are named `iran<port>.toml`, client configurations `kharej<port>.toml`, and certificates are stored in `cert_files/` within the configuration directory. Use **Health check and file locations** for the exact paths on a server.
 
-Rerun the install command whenever you want to open the menu again. After **5. Update script**, run `bh` directly.
+Rerun the install command whenever you want to open the menu again. After **6. Update script**, run `bh` directly.
 
 ## Edit an existing tunnel
 
@@ -122,11 +122,11 @@ Choose **My tunnels → select a tunnel → 2) Test connection**. Diagnostics re
 Choose one test:
 
 - **1) Quick TCP reachability:** ten sequential TCP connects to the selected tunnel address. On KHAREJ this measures the route to IRAN; on IRAN it checks the local listener only. It reports connection success, connect latency and jitter. These results do not prove authentication or forwarded traffic, and failed connects are not a measurement of packet loss. IPX does not use this TCP listener check.
-- **2) Real traffic test (IRAN):** select one configured port mapping. The script prints a `bh-test://1.…` link. On KHAREJ, select the matching tunnel, choose **3) Start responder**, and paste that test link. Once KHAREJ says **Ready**, press Enter on IRAN. The test verifies 60 echoes over one persistent connection, then an exact 1 MiB bulk echo. It reports round-trip latency, jitter and the combined upload/download echo rate.
+- **2) Real traffic test (IRAN):** select one configured port mapping. The script prints a `bh-test://1.…` link. On KHAREJ, select the matching tunnel, choose **2) Start responder**, and paste that test link. Once KHAREJ says **Ready**, press Enter on IRAN. The test verifies 60 echoes over one persistent connection, then an exact 1 MiB bulk echo. It reports round-trip latency, jitter and the combined upload/download echo rate.
 
 The KHAREJ backend port must be unused: the responder refuses occupied ports and never stops an application. If necessary, add an unused mapping such as `55000=55000` through **Edit → Port mappings**, then remove it after testing. Range mappings let you choose one port in the range.
 
-Only the selected existing tunnel carries this test traffic. This selected-tunnel test starts no additional BH core, changes no tunnel configuration, and does not try other transports or mappings. A lock allows one diagnostic test per server at a time. Use main-menu **7. Compare transports** for an automatic comparison of transport candidates.
+Only the selected existing tunnel carries this test traffic. This selected-tunnel test starts no additional BH core, changes no tunnel configuration, and does not try other transports or mappings. A lock allows one diagnostic test per server at a time. Use main-menu **4. Compare transports** for an automatic comparison of transport candidates.
 
 Keep the test link private. The temporary responder supports PROXY protocol headers and exits when the test finishes, when you cancel with Ctrl+C, or after ten minutes. A successful echo test proves the selected path carried those test bytes; it does not test every forwarded service or guarantee future route quality.
 
@@ -134,10 +134,10 @@ Keep the test link private. The temporary responder supports PROXY protocol head
 
 This adapts [BackPack's Connection Test](https://github.com/AminMGMT/BackPack/blob/main/internal/manage/conntest.go) to the transports supported by this repository's BH core. It creates temporary paired test tunnels and runs **one transport at a time**. It compares `tcp`, `tcpmux`, `xtcpmux`, `ws`, `wss`, `wsmux`, `wssmux`, `xwsmux`, `anytls`, `tun/tcp`, and `tun/ipx` with each of `icmp`, `ipip`, `udp`, `tcp`, `gre`, and `bip`.
 
-1. On IRAN, choose **7. Compare transports → 1) IRAN**. Enter the public address and two unused TCP ports (defaults: control `54000`, tunnel `54001`). The tunnel port is reused for every candidate so the comparison uses the same port on the route.
+1. On IRAN, choose **4. Compare transports → 1) IRAN**. Enter the public address and two unused TCP ports (defaults: control `54000`, tunnel `54001`). The tunnel port is reused for every candidate so the comparison uses the same port on the route.
 2. Choose **Quick** (10 echoes over 5 seconds per working transport) or **Stability** (60 echoes over 60 seconds). Stability helps detect connections that drop after a short time. Each working transport also transfers a verified 8 MiB upload and 8 MiB download.
 3. Confirm the temporary pause. Copy the displayed `bh-compare://1.…` link.
-4. On KHAREJ, choose **7. Compare transports → 2) KHAREJ**, paste the link and confirm its temporary pause. Testing then starts automatically; both servers show the results.
+4. On KHAREJ, choose **4. Compare transports → 2) KHAREJ**, paste the link and confirm its temporary pause. Testing then starts automatically; both servers show the results.
 
 The table reports **AVAILABLE**, **UNSTABLE**, **DOWN**, **ERROR**, or **SKIPPED**, with average ping, jitter, upload/download Mbit/s and verified echo counts. **AVAILABLE** requires every echo and both payload transfers to succeed. Ping is application round-trip latency through the actual tunnel, rather than ICMP ping to the public server. Speeds are measured from IRAN: upload sends to KHAREJ, download receives from KHAREJ. Skipped prerequisites and startup errors have their own explanation; missing measurements show `-`. The fastest fully verified candidate is identified, and both servers save `transport-test-results.json` in the configuration directory without test credentials.
 
@@ -151,9 +151,9 @@ On completion, Ctrl+C, or a handled failure, test processes, sockets, files and 
 
 The selected tunnel's management menu also offers:
 
-- **4) Health check & file locations:** core executable permissions, service state, weak default-token detection, TLS expiry, config/backup/service paths and the selected service's recent logs. It reports suggestions without changing settings.
-- **6) Start / stop tunnel:** controls only that service. Stopping does not disable its existing boot setting.
-- **9) Restore previous settings:** previews the transport in the `.toml.bak` file, then restores and restarts only the selected tunnel after confirmation. If the restored configuration cannot start, it recovers the current configuration.
+- **Health check & file locations:** core executable permissions, service state, weak default-token detection, TLS expiry, config/backup/service paths and the selected service's recent logs. It reports suggestions without changing settings.
+- **Start / stop tunnel:** controls only that service. Stopping does not disable its existing boot setting.
+- **Restore previous settings:** previews the transport in the `.toml.bak` file, then restores and restarts only the selected tunnel after confirmation. If the restored configuration cannot start, it recovers the current configuration.
 
 The [BackPack feature review](docs/backpack-review.md) records the source reviewed, the features adapted, and which features require a different tunnel engine.
 
