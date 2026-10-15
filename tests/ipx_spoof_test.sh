@@ -13,6 +13,26 @@ ip() { echo 'default via 192.0.2.254 dev eth0'; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_value() { [[ "$(edit_value "$1")" == "$2" ]] || fail "$1: $(edit_value "$1") != $2"; }
 
+# Both menu branches share the profile selection; only spoof asks for spoof IPs.
+for encapsulation in ipx ipx-spoof; do
+    for profile in icmp ipip udp tcp gre bip; do
+        reset_config
+        prompt_transport_section server > /dev/null <<< "$(printf 'tun\n%s\n' "$encapsulation")"
+        answers=$(printf '%s\n\n192.0.2.2\n' "$profile")
+        if [[ "$encapsulation" == ipx-spoof ]]; then
+            answers+=$'\n203.0.113.2\n203.0.113.1'
+        fi
+        answers+=$'\neth0\n0\n0'
+        prompt_ipx_section true server > /dev/null <<< "$answers"
+        [[ "${CONFIG[ipx_profile]}" == "$profile" && "${CONFIG[ipx_interface]}" == eth0 ]] || fail 'IPX profile prompt sequence'
+        if [[ "$encapsulation" == ipx-spoof ]]; then
+            [[ "${CONFIG[ipx_custom_packet]}" == true && "${CONFIG[ipx_spoof_src_ip]}" == 203.0.113.2 ]] || fail 'spoof branch'
+        else
+            [[ "${CONFIG[ipx_custom_packet]}" == false && -z "${CONFIG[ipx_spoof_src_ip]+present}" ]] || fail 'ordinary branch'
+        fi
+    done
+done
+
 reset_config
 prompt_transport_section server > /dev/null <<'EOF'
 tun
@@ -20,10 +40,9 @@ ipx-spoof
 EOF
 [[ "${CONFIG[transport_type]}" == tun && "${CONFIG[tun_encapsulation]}" == ipx && "${CONFIG[ipx_custom_packet]}" == true ]] || fail 'spoof selection'
 prompt_ipx_section true server > /dev/null <<'EOF'
-
+icmp
 
 192.0.2.2
-
 999.1.1.1
 203.0.113.2
 203.0.113.1

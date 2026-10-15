@@ -339,6 +339,8 @@ prompt_transport_section() {
     if [[ "${CONFIG[tun_encapsulation]}" == "ipx-spoof" ]]; then
         CONFIG[tun_encapsulation]="ipx"
         CONFIG[ipx_custom_packet]="true"
+    else
+        CONFIG[ipx_custom_packet]="false"
     fi
 
     echo
@@ -587,15 +589,12 @@ prompt_ports_section() {
 prompt_ipx_section() {
     local is_ipx="$1"
     local mode="$2"
-    local default_profile=tcp
 
     [[ "$is_ipx" != "true" ]] && return
 
     colorize blue "━━━ IPX Configuration ━━━" bold
 
     CONFIG[ipx_mode]="$mode"
-
-    [[ "${CONFIG[ipx_custom_packet]}" == true ]] && default_profile=icmp
 
     # Available profiles
     AVAILABLE_PROFILES=("icmp" "ipip" "udp" "tcp" "gre" "bip")
@@ -605,7 +604,7 @@ prompt_ipx_section() {
 
     while true; do
         # Prompt user with default
-        prompt_with_default "Profile" "$default_profile" CONFIG[ipx_profile]
+        prompt_with_default "Profile" "tcp" CONFIG[ipx_profile]
 
         # Normalize to lowercase
         CONFIG[ipx_profile]="${CONFIG[ipx_profile],,}"
@@ -636,7 +635,6 @@ prompt_ipx_section() {
     done
 
 
-    prompt_boolean "Enable IPX Spoof (custom packet)" "${CONFIG[ipx_custom_packet]:-false}" CONFIG[ipx_custom_packet]
     if [[ "${CONFIG[ipx_custom_packet]}" == true ]]; then
         echo 'Use the opposite spoof source/destination IPs on the peer server.'
         local field
