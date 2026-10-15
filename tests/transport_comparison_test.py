@@ -125,6 +125,8 @@ class ComparisonTests(unittest.TestCase):
             if '/ipx/' in case:
                 self.assertNotIn('listener', iran)
                 self.assertNotIn('dialer', kharej)
+                self.assertIs(iran['ipx']['custom_packet'], False)
+                self.assertIs(kharej['ipx']['custom_packet'], False)
                 self.assertEqual(iran['ipx']['mode'], 'server')
                 self.assertEqual(kharej['ipx']['mode'], 'client')
                 self.assertEqual(iran['ipx']['listen_ip'], kharej['ipx']['dst_ip'])

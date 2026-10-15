@@ -323,7 +323,7 @@ prompt_transport_section() {
     # if tun selected, get encapsulation type
     if [[ "${CONFIG[transport_type]}" == "tun" ]]; then
         echo
-        local encapsulations=(tcp ipx)
+        local encapsulations=(tcp ipx ipx-spoof)
         echo "Available encapsulations:"
         printf '  • %s\n' "${encapsulations[@]}"
 
@@ -333,6 +333,12 @@ prompt_transport_section() {
               [[ " ${encapsulations[*]} " =~ " ${CONFIG[tun_encapsulation]} " ]] && break
               colorize red "Invalid encapsulation."
           done
+    fi
+
+    # Spoof is an IPX mode, not a different core encapsulation.
+    if [[ "${CONFIG[tun_encapsulation]}" == "ipx-spoof" ]]; then
+        CONFIG[tun_encapsulation]="ipx"
+        CONFIG[ipx_custom_packet]="true"
     fi
 
     echo
@@ -581,12 +587,15 @@ prompt_ports_section() {
 prompt_ipx_section() {
     local is_ipx="$1"
     local mode="$2"
+    local default_profile=tcp
 
     [[ "$is_ipx" != "true" ]] && return
 
     colorize blue "━━━ IPX Configuration ━━━" bold
 
     CONFIG[ipx_mode]="$mode"
+
+    [[ "${CONFIG[ipx_custom_packet]}" == true ]] && default_profile=icmp
 
     # Available profiles
     AVAILABLE_PROFILES=("icmp" "ipip" "udp" "tcp" "gre" "bip")
@@ -596,7 +605,7 @@ prompt_ipx_section() {
 
     while true; do
         # Prompt user with default
-        prompt_with_default "Profile" "tcp" CONFIG[ipx_profile]
+        prompt_with_default "Profile" "$default_profile" CONFIG[ipx_profile]
 
         # Normalize to lowercase
         CONFIG[ipx_profile]="${CONFIG[ipx_profile],,}"
@@ -627,6 +636,20 @@ prompt_ipx_section() {
     done
 
 
+    prompt_boolean "Enable IPX Spoof (custom packet)" "${CONFIG[ipx_custom_packet]:-false}" CONFIG[ipx_custom_packet]
+    if [[ "${CONFIG[ipx_custom_packet]}" == true ]]; then
+        echo 'Use the opposite spoof source/destination IPs on the peer server.'
+        local field
+        for field in spoof_src_ip spoof_dst_ip; do
+            while true; do
+                prompt_with_default "$field (whitelisted IPv4)" "" "CONFIG[ipx_$field]"
+                valid_ipv4 "${CONFIG[ipx_$field]}" && break
+                colorize red 'Enter a valid IPv4 address.'
+            done
+        done
+    fi
+
+    local interface
     interface=$(ip route show default | awk '{print $5}')
     prompt_with_default "Network Interface" $interface CONFIG[ipx_interface]
 
@@ -705,6 +728,11 @@ generate_toml_config() {
             toml_string_setting "profile" "${CONFIG[ipx_profile]}"
             toml_string_setting "listen_ip" "${CONFIG[ipx_listen_ip]}"
             toml_string_setting "dst_ip" "${CONFIG[ipx_dst_ip]}"
+            echo "custom_packet = ${CONFIG[ipx_custom_packet]:-false}"
+            if [[ "${CONFIG[ipx_custom_packet]}" == true ]]; then
+                toml_string_setting "spoof_src_ip" "${CONFIG[ipx_spoof_src_ip]}"
+                toml_string_setting "spoof_dst_ip" "${CONFIG[ipx_spoof_dst_ip]}"
+            fi
             toml_string_setting "interface" "${CONFIG[ipx_interface]}"
             [[ -n "${CONFIG[ipx_icmp_type]}" ]] && echo "icmp_type = ${CONFIG[ipx_icmp_type]}"
             [[ -n "${CONFIG[ipx_icmp_code]}" ]] && echo "icmp_code = ${CONFIG[ipx_icmp_code]}"
@@ -1030,6 +1058,10 @@ EOF
 profile|"tcp"
 dst_ip|""
 EOF
+            echo 'custom_packet|false'
+            if [[ "$(edit_value ipx.custom_packet)" == true ]]; then
+                echo 'spoof_src_ip|""'; echo 'spoof_dst_ip|""'
+            fi
             echo "interface|$(jq -Rn --arg value "$default_interface" '$value')"
             if [[ "$(edit_value ipx.profile)" == icmp ]]; then
                 echo 'icmp_type|0'; echo 'icmp_code|0'
@@ -1222,6 +1254,8 @@ edit_prompt_field() {
                 validate_cidr "$input" || { colorize red 'Enter a host address with CIDR, e.g. 10.10.10.1/24.'; continue; } ;;
             security.token|security.psk|ipx.dst_ip|ipx.interface|tls.tls_cert|tls.tls_key)
                 [[ -n "$input" ]] || { colorize red 'This setting cannot be empty.'; continue; } ;;
+            ipx.spoof_src_ip|ipx.spoof_dst_ip)
+                valid_ipv4 "$input" || { colorize red 'Enter a valid IPv4 address.'; continue; } ;;
             dialer.edge_ip) [[ "$input" == - ]] && input="" ;;
         esac
         case "$type" in
@@ -1281,6 +1315,9 @@ edit_normalize() {
         unset 'EDIT_VALUES[security.algorithm]' 'EDIT_VALUES[security.psk]' 'EDIT_VALUES[security.kdf_iterations]'
     fi
     [[ "$(edit_value ipx.profile)" == icmp ]] || unset 'EDIT_VALUES[ipx.icmp_type]' 'EDIT_VALUES[ipx.icmp_code]'
+    if [[ "$(edit_value ipx.custom_packet)" == false ]]; then
+        unset 'EDIT_VALUES[ipx.spoof_src_ip]' 'EDIT_VALUES[ipx.spoof_dst_ip]'
+    fi
     edit_sections
 }
 
@@ -1292,6 +1329,10 @@ edit_complete_transport() {
     if [[ "$(edit_value transport.type)" == tun && -z "${EDIT_VALUES[tun.encapsulation]}" ]]; then
         edit_prompt_field tun.encapsulation '"tcp"' || return 1
         edit_normalize
+    fi
+    # Existing ordinary IPX configurations keep their behavior without a new prompt.
+    if [[ "$(edit_value tun.encapsulation)" == ipx && -z "${EDIT_VALUES[ipx.custom_packet]+present}" ]]; then
+        EDIT_VALUES[ipx.custom_packet]=false
     fi
     for section in "${EDIT_SECTIONS[@]}"; do
         if [[ "$section" == security && "$(edit_value tun.encapsulation)" == ipx && -z "${EDIT_VALUES[security.enable_encryption]}" ]]; then
@@ -1346,7 +1387,7 @@ edit_section_menu() {
         i=$((10#$choice-1))
         edit_prompt_field "$section.${keys[$i]}" "${defaults[$i]}" || return 1
         case "$section.${keys[$i]}" in
-            transport.type|tun.encapsulation|security.enable_encryption|ipx.profile|transport.accept_udp)
+            transport.type|tun.encapsulation|security.enable_encryption|ipx.profile|ipx.custom_packet|transport.accept_udp)
                 edit_complete_transport || return 1 ;;
         esac
         edit_normalize
@@ -1525,6 +1566,16 @@ decode_backhaul_link() {
     }
 }
 
+valid_ipv4() {
+    local address="$1" octet
+    local -a octets
+    [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$address"
+    for octet in "${octets[@]}"; do
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
 valid_endpoint() {
     local address="$1" port
     [[ "$address" =~ ^([a-zA-Z0-9._-]+|\[[a-fA-F0-9:]+\]):([0-9]{1,5})$ ]] || return 1
@@ -1533,7 +1584,7 @@ valid_endpoint() {
 }
 
 peer_setup_link() {
-    local file="$1" edit_mode=client host port endpoint id section key default old_local old_listen
+    local file="$1" edit_mode=client host port endpoint id section key default old_local old_listen old_spoof
     local -A allowed
     [[ "$(basename "$file")" == iran*.toml ]] || { colorize red 'Export the setup link on the IRAN server.'; return 1; }
     edit_load_config "$file" || return 1
@@ -1556,6 +1607,11 @@ peer_setup_link() {
         old_listen="${EDIT_VALUES[ipx.listen_ip]}"
         EDIT_VALUES[ipx.listen_ip]="${EDIT_VALUES[ipx.dst_ip]}"
         EDIT_VALUES[ipx.dst_ip]="$old_listen"
+        if [[ "$(edit_value ipx.custom_packet)" == true ]]; then
+            old_spoof="${EDIT_VALUES[ipx.spoof_src_ip]}"
+            EDIT_VALUES[ipx.spoof_src_ip]="${EDIT_VALUES[ipx.spoof_dst_ip]}"
+            EDIT_VALUES[ipx.spoof_dst_ip]="$old_spoof"
+        fi
         EDIT_VALUES[ipx.mode]='"client"'
         unset 'EDIT_VALUES[ipx.interface]'
     fi
@@ -1609,6 +1665,11 @@ validate_setup_settings() {
         [[ -n "$(edit_value security.token)" ]] || { colorize red 'Missing security token.'; return 1; }
     else
         [[ "$(edit_value ipx.mode)" == client && -n "$(edit_value ipx.listen_ip)" && -n "$(edit_value ipx.dst_ip)" ]] || return 1
+        if [[ "$(edit_value ipx.custom_packet)" == true ]]; then
+            valid_ipv4 "$(edit_value ipx.spoof_src_ip)" && valid_ipv4 "$(edit_value ipx.spoof_dst_ip)" || {
+                colorize red 'IPX Spoof requires valid source and destination IPv4 addresses.'; return 1;
+            }
+        fi
         [[ -n "${EDIT_VALUES[security.enable_encryption]}" ]] || return 1
         if [[ "$(edit_value security.enable_encryption)" == true ]]; then
             psk_hex=$(set -o pipefail; printf '%s' "$(edit_value security.psk)" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n') || {
@@ -2116,7 +2177,8 @@ def render_config(side, case, link, entry, backend, interface, net, cert, key):
                           'remote_addr': remote + '/30', 'health_port': link['health'], 'mtu': 1320 if ipx else 1500}
     if ipx:
         section['ipx'] = {'mode': 'server' if side == 'iran' else 'client', 'profile': parts[2],
-                          'listen_ip': net['local'], 'dst_ip': net['peer'], 'interface': net['interface']}
+                          'listen_ip': net['local'], 'dst_ip': net['peer'], 'interface': net['interface'],
+                          'custom_packet': False}
         if parts[2] == 'icmp':
             section['ipx'].update(icmp_type=0, icmp_code=0)
         psk = base64.b64encode(bytes.fromhex(derived(link['secret'], 'ipx-psk'))).decode()
