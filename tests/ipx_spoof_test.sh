@@ -5,8 +5,7 @@ set -eo pipefail
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
-source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/bh.sh" | sed '$d')
-source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/bh.sh" | sed '$d')
+source "$repo_dir/bh.sh"
 SERVER_IP=192.0.2.1
 colorize() { :; }
 ip() { echo 'default via 192.0.2.254 dev eth0'; }

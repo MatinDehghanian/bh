@@ -11,8 +11,7 @@ trap 'test_status=$?; if ((test_status)); then tail -50 "$test_dir/menu-output.l
 PYTHON=${PYTHON:-python3}
 
 # Load only definitions, avoiding package installation, downloads and the menu loop.
-source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/bh.sh" | sed '$d')
-source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/bh.sh" | sed '$d')
+source "$repo_dir/bh.sh"
 config_dir="$test_dir"
 CERT_DIR="$test_dir/certs"
 CERT_FILE="$CERT_DIR/cert.crt"
@@ -179,7 +178,8 @@ assert_value listener.bind_addr :9443
 assert_value ports.mapping 443=5443
 cmp "$test_dir/before.toml" "$test_dir/iran8443.toml.bak"
 grep -q '^restart backhaul-iran8443.service$' "$test_dir/systemctl.log" || fail 'edited service was not restarted'
-grep -q 'keep # token' "$test_dir/menu-output.log" || fail 'menu did not show current settings'
+if grep -q 'keep # token' "$test_dir/menu-output.log"; then fail 'menu exposed security token'; fi
+grep -q 'Credentials.*hidden' "$test_dir/menu-output.log" || fail 'missing credential summary'
 echo 'PASS: easy menu edits address/mappings, saves, backs up and restarts the same service'
 
 cp "$test_dir/iran8443.toml" "$test_dir/before.toml"

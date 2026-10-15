@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define script version
-SCRIPT_VERSION="v1.3.0"
+SCRIPT_VERSION="v1.4.0"
 
 if ((BASH_VERSINFO[0] < 4)); then
     echo "This script requires Bash 4 or newer."
@@ -14,16 +14,6 @@ config_dir="/root/backhaul-core"
 CERT_DIR="/root/backhaul-core/cert_files"
 CERT_FILE="$CERT_DIR/cert.crt"
 KEY_FILE="$CERT_DIR/cert.key"
-
-# Ensure cert_files directory exists
-mkdir -p "$CERT_DIR"
-
-# Check if the script is run as root
-if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root"
-   sleep 1
-   exit 1
-fi
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -53,22 +43,211 @@ colorize() {
         normal | *) style_code=$normal ;;
     esac
 
-    echo -e "${style_code}${color_code}${text}${reset}"
+    if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-dumb}" != dumb ]]; then
+        printf '%b%s%b\n' "${style_code}${color_code}" "$text" "$reset"
+    else
+        printf '%s\n' "$text"
+    fi
 }
 
 press_key() {
-    read -r -p "Press any key to continue..."
+    local reply
+    read -r -p 'Press Enter to continue... ' reply || return 0
+}
+
+ui_clear() {
+    [[ -t 1 && "${TERM:-dumb}" != dumb ]] && printf '\033[H\033[2J'
+    return 0
+}
+
+ui_rule() {
+    local width="${COLUMNS:-72}" line
+    [[ "$width" =~ ^[0-9]{1,3}$ ]] || width=72
+    ((width > 80)) && width=80
+    ((width < 32)) && width=32
+    printf -v line '%*s' "$((width-4))" ''
+    colorize blue "  ${line// /─}"
+}
+
+ui_header() {
+    ui_clear
+    echo
+    colorize cyan "  BH  /  $1" bold
+    [[ -n "${2:-}" ]] && printf '  %s\n' "$2"
+    ui_rule
+}
+
+ui_section() {
+    printf '\n'
+    colorize cyan "  $1" bold
+}
+
+ui_item() {
+    printf '  %3s  %s\n' "$1" "$2"
+}
+
+ui_hint() {
+    printf '  %s\n' "$1"
+}
+
+ui_confirm() {
+    local reply
+    read -r -p "$1 [y/N]: " reply || return 1
+    [[ "${reply,,}" == y || "${reply,,}" == yes ]]
+}
+
+ui_read_choice() {
+    local target="$1" reply
+    read -r -p '  Your choice: ' reply || return 1
+    printf -v "$target" '%s' "$reply"
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+valid_choice() {
+    local choices="$1" value="$2" choice
+    local -a list
+    read -r -a list <<< "$choices"
+    for choice in "${list[@]}"; do [[ "$choice" == "$value" ]] && return 0; done
+    return 1
+}
+
+valid_host() {
+    local host="$1" label
+    [[ ${#host} -le 253 && -n "$host" ]] || return 1
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then valid_ipv4 "$host"; return; fi
+    # Accept bracketed IPv6 literals; reject empty/overlong/invalid groups.
+    if [[ "$host" == \[*\] ]]; then
+        host="${host:1:${#host}-2}"
+        if [[ "$host" == *.* ]]; then
+            valid_ipv4 "${host##*:}" || return 1
+            host="${host%:*}:0:0"
+        fi
+        [[ "$host" == *:* && "$host" =~ ^[a-fA-F0-9:]+$ && "$host" != *:::* ]] || return 1
+        [[ "$host" != :* || "$host" == ::* ]] && [[ "$host" != *: || "$host" == *:: ]] || return 1
+        local rest="${host//[^:]/}" groups=0
+        [[ "$host" != *::*::* ]] || return 1
+        (( ${#rest} <= 8 )) || return 1
+        local -a labels
+        IFS=: read -r -a labels <<< "$host"
+        for label in "${labels[@]}"; do
+            [[ -z "$label" || ${#label} -le 4 ]] || return 1
+            [[ -z "$label" ]] || ((groups+=1))
+        done
+        if [[ "$host" == *::* ]]; then ((groups < 8));
+        else [[ "$host" != :* && "$host" != *: ]] && ((groups == 8)); fi
+        return
+    fi
+    host="${host%.}"
+    [[ "$host" =~ ^[a-zA-Z0-9.-]+$ && "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+    local -a labels
+    IFS=. read -r -a labels <<< "$host"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && "$label" != -* && "$label" != *- ]] || return 1
+    done
+}
+
+valid_listener() {
+    local address="$1" host="${1%:*}"
+    [[ "$address" == *:* ]] && valid_port "${address##*:}" || return 1
+    [[ -z "$host" ]] || valid_host "$host"
+}
+
+valid_psk() {
+    local hex
+    hex=$(set -o pipefail; printf '%s' "$1" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n') || return 1
+    [[ ${#hex} -eq 64 ]]
+}
+
+# One validator is shared by the wizard, editor and imported settings.
+validate_setting() {
+    local id="$1" value="$2" minimum=0 maximum=2147483647
+    case "$id" in
+        listener.bind_addr) valid_listener "$value" ;;
+        dialer.remote_addr) valid_endpoint "$value" ;;
+        dialer.edge_ip) [[ -z "$value" ]] || valid_host "$value" ;;
+        tun.local_addr|tun.remote_addr) validate_cidr "$value" ;;
+        ipx.listen_ip|ipx.dst_ip|ipx.spoof_src_ip|ipx.spoof_dst_ip) valid_ipv4 "$value" ;;
+        tun.name|ipx.interface) [[ "$value" =~ ^[a-zA-Z0-9_.-]{1,15}$ && "$value" != . && "$value" != .. ]] ;;
+        security.psk) valid_psk "$value" ;;
+        security.token|tls.tls_cert|tls.tls_key|tls.sni) [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] ;;
+        *)
+            case "$id" in
+                tun.health_port) minimum=1; maximum=65535 ;;
+                tun.mtu) minimum=576; maximum=65535 ;;
+                ipx.icmp_type|ipx.icmp_code) maximum=255 ;;
+                mux.mux_version) minimum=1; maximum=2 ;;
+                transport.heartbeat_interval|transport.heartbeat_timeout|transport.keepalive_period|dialer.dial_timeout|dialer.retry_interval|security.kdf_iterations|mux.mux_concurrency|mux.mux_framesize|mux.mux_recievebuffer|mux.mux_streambuffer|tuning.channel_size|tuning.batch_size|accept_udp.ring_size|accept_udp.frame_size) minimum=1 ;;
+                transport.connection_pool|tuning.workers|tuning.so_sndbuf|tuning.so_rcvbuf|tuning.tcp_mss|tuning.read_timeout|accept_udp.peer_idle_timeout_s|accept_udp.write_timeout_ms) ;;
+                *) return 0 ;;
+            esac
+            [[ "$value" =~ ^[0-9]{1,10}$ ]] && ((10#$value >= minimum && 10#$value <= maximum))
+            ;;
+    esac
+}
+
+prompt_setting_id() {
+    local key="${1#CONFIG[}"
+    key="${key%]}"
+    case "$key" in
+        bind_addr) echo listener.bind_addr ;;
+        remote_addr|edge_ip|dial_timeout|retry_interval) echo "dialer.$key" ;;
+        tun_*) echo "tun.${key#tun_}" ;;
+        ipx_*) echo "ipx.${key#ipx_}" ;;
+        token|psk|kdf_iterations|algorithm) echo "security.$key" ;;
+        connection_pool|heartbeat_interval|heartbeat_timeout|keepalive_period) echo "transport.$key" ;;
+        mux_*) echo "mux.$key" ;;
+        workers|channel_size|batch_size|so_sndbuf|so_rcvbuf|tcp_mss|read_timeout|tuning_profile|buffer_profile) echo "tuning.$key" ;;
+        log_level) echo logging.log_level ;;
+    esac
+}
+
+prompt_advanced() {
+    if [[ "${setup_style:-advanced}" == quick ]]; then
+        printf -v "$3" '%s' "$2"
+    else
+        prompt_with_default "$@"
+    fi
+}
+
+prompt_advanced_boolean() {
+    if [[ "${setup_style:-advanced}" == quick ]]; then
+        printf -v "$3" '%s' "$2"
+    else
+        prompt_boolean "$@"
+    fi
 }
 
 prompt_with_default() {
     local prompt="$1"
     local default="$2"
     local var_name="$3"
-    local input
-
-    echo -ne "[-] $prompt (default: $default): "
-    read -r input
-    printf -v "$var_name" '%s' "${input:-$default}"
+    local reply setting choices
+    setting=$(prompt_setting_id "$var_name")
+    choices=$(edit_choices "$setting")
+    while true; do
+        printf '  %s' "$prompt"
+        if [[ "$setting" == security.token || "$setting" == security.psk ]]; then
+            [[ -n "$default" ]] && printf ' [Enter keeps the generated/current secret]'
+        elif [[ -n "$default" ]]; then printf ' [%s]' "$default"; fi
+        printf ': '
+        read -r reply || return 1
+        [[ "$reply" == /cancel ]] && return 1
+        reply="${reply:-$default}"
+        [[ "$setting" == listener.bind_addr && "$reply" != *:* ]] && reply=":$reply"
+        if [[ -n "$setting" ]] && ! validate_setting "$setting" "$reply"; then
+            colorize red "  Invalid $prompt. Please try again (or /cancel)."
+            continue
+        fi
+        [[ -n "$choices" ]] && reply="${reply,,}"
+        if [[ -n "$choices" ]] && ! valid_choice "$choices" "$reply"; then
+            colorize red "  Choose one of: $choices"; continue
+        fi
+        printf -v "$var_name" '%s' "$reply"
+        return 0
+    done
 }
 
 toml_string_setting() {
@@ -81,12 +260,18 @@ prompt_boolean() {
     local var_name="$3"
 
     while true; do
-        prompt_with_default "$prompt [true/false]" "$default" "$var_name"
+        prompt_with_default "$prompt [y/n]" "$default" "$var_name" || return 1
         local value="${!var_name}"
+        case "${value,,}" in
+            y|yes|1) printf -v "$var_name" true ;;
+            n|no|0) printf -v "$var_name" false ;;
+            true|false) printf -v "$var_name" '%s' "${value,,}" ;;
+        esac
+        value="${!var_name}"
         if [[ "$value" == "true" || "$value" == "false" ]]; then
             break
         fi
-        colorize red "Invalid input. Please enter 'true' or 'false'."
+        colorize red "Enter y or n (true / false also work)."
     done
 }
 
@@ -144,48 +329,63 @@ install_jq() {
     if ! command -v jq &> /dev/null; then
         if command -v apt-get &> /dev/null; then
             colorize yellow "Installing jq..."
-            sudo apt-get update && sudo apt-get install -y jq
+            apt-get update && apt-get install -y jq || return 1
         else
             colorize red "Error: Unsupported package manager. Please install jq manually."
-            press_key
-            exit 1
+            return 1
         fi
     fi
+    command -v jq >/dev/null
+}
+
+valid_core_binary() {
+    local header machine
+    header=$(od -An -N6 -tx1 "$1" 2>/dev/null | tr -d ' \n')
+    machine=$(od -An -j18 -N2 -tx1 "$1" 2>/dev/null | tr -d ' \n')
+    [[ "$header" == 7f454c460201 && "$machine" == 3e00 ]]
 }
 
 download_bh() {
-    if [[ "$1" == "menu" ]]; then
-        colorize cyan "Restart all services after updating to new core" bold
-        sleep 2
+    if [[ "${1:-}" == "menu" ]]; then
+        ui_section 'Update BH Core'
+        ui_hint 'The new executable is used when you next restart a tunnel.'
+        ui_confirm 'Download and replace BH Core?' || return 0
     elif [[ -f "${config_dir}/backhaul_premium" ]]; then
-        chmod +x "${config_dir}/backhaul_premium" || exit 1
+        chmod +x "${config_dir}/backhaul_premium" || return 1
         return 0
     fi
 
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) colorize red 'The bundled BH Core requires Linux x86-64.'; return 1 ;;
+    esac
+
     local download_url="https://raw.githubusercontent.com/MatinDehghanian/bh/refs/heads/main/bh"
     local download_dir
-    mkdir -p "$config_dir" || exit 1
-    download_dir=$(mktemp -d "${config_dir}/.bh-download.XXXXXX") || exit 1
+    mkdir -p "$config_dir" || return 1
+    download_dir=$(mktemp -d "${config_dir}/.bh-download.XXXXXX") || return 1
     echo "Downloading BH..."
 
     if ! curl -fSL --retry 2 --max-time 30 -o "$download_dir/bh" "$download_url"; then
         colorize red "Download failed."
         rm -rf "$download_dir"
-        exit 1
+        return 1
     fi
 
     # Keep the installed executable name used by existing tunnel services.
-    if ! chmod +x "$download_dir/bh" || ! mv -f "$download_dir/bh" "${config_dir}/backhaul_premium"; then
-        colorize red "BH installation failed."
+    if ! valid_core_binary "$download_dir/bh" || ! chmod +x "$download_dir/bh" || ! mv -f "$download_dir/bh" "${config_dir}/backhaul_premium"; then
+        colorize red 'BH installation failed or the download is not an x86-64 ELF executable. The previous core was kept.'
         rm -rf "$download_dir"
-        exit 1
+        return 1
     fi
     rm -rf "$download_dir"
     colorize green "BH installation completed."
 }
 
-install_jq
-download_bh
+# Startup lives in main so loading helpers has no installation side effects.
+install_dependencies() {
+    install_jq
+}
 
 # ============================================================================
 # CONFIGURATION SECTIONS - MODULAR PROMPTING
@@ -203,11 +403,16 @@ reset_config() {
 prompt_connection_section() {
     local mode="$1"  # server or client
 
-    colorize blue "━━━ Connection Configuration ━━━" bold
+    ui_section "Connection Configuration"
 
     if [[ "$mode" == "server" ]]; then
         # Server: listener section
-        prompt_with_default "Bind Address" ":8443" CONFIG[bind_addr]
+        while true; do
+            prompt_with_default 'IRAN listen address (e.g. :8443)' ':8443' CONFIG[bind_addr] || return 1
+            [[ "${CONFIG[bind_addr]}" == *:* ]] || CONFIG[bind_addr]=":${CONFIG[bind_addr]}"
+            valid_listener "${CONFIG[bind_addr]}" && break
+            colorize red 'Use :port, IPv4:port, or [IPv6]:port (1-65535).'
+        done
 
         # If no colon is included, prepend ":"
         if [[ -n "${CONFIG[bind_addr]}" && "${CONFIG[bind_addr]}" != *:* ]]; then
@@ -219,7 +424,8 @@ prompt_connection_section() {
         # Client: dialer section
         while true; do
             echo -ne "[*] IRAN Server Address [IP:Port] or [Domain:Port]: "
-            read -r CONFIG[remote_addr]
+            read -r CONFIG[remote_addr] || return 1
+            [[ "${CONFIG[remote_addr]}" == /cancel ]] && return 1
 
             # Check non-empty
             if [[ -z "${CONFIG[remote_addr]}" ]]; then
@@ -230,18 +436,16 @@ prompt_connection_section() {
             # Validate pattern: IP:Port or Domain:Port
             # IP: 1-3 digits per octet, 0-255 (basic check), Port: 1-65535
             # Domain: letters, digits, hyphens, dots
-            if [[ "${CONFIG[remote_addr]}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ || \
-                  "${CONFIG[remote_addr]}" =~ ^[a-zA-Z0-9.-]+:[0-9]{1,5}$ ]]; then
+            if valid_endpoint "${CONFIG[remote_addr]}"; then
                 break
             else
-                colorize red "Invalid format. Use IP:Port or Domain:Port."
+                colorize red 'Use IPv4:port, domain:port, or [IPv6]:port (1-65535).'
             fi
         done
 
       #Port Mapping Configuration  # Edge IP/Domain only for ws wss wsmux wssmux xwsmux
         if [[ "${CONFIG[transport_type]}" == "ws" || "${CONFIG[transport_type]}" == "wss" || "${CONFIG[transport_type]}" == "wsmux" || "${CONFIG[transport_type]}" == "wssmux" || "${CONFIG[transport_type]}" == "xwsmux" ]]; then
-            echo -ne "[-] Edge IP/Domain (optional, press Enter to skip): "
-            read -r CONFIG[edge_ip]
+            prompt_with_default 'Edge IP/domain (optional)' '' CONFIG[edge_ip] || return 1
         fi
 
         #CONFIG[remote_addrs]="[]"
@@ -268,18 +472,19 @@ is_valid_algorithm() {
 
 prompt_security_section() {
     local is_ipx="$1"
+    local mode="${2:-server}"
 
-    colorize blue "━━━ Security Configuration ━━━" bold
+    ui_section "Security Configuration"
 
     if [[ "$is_ipx" == "true" ]]; then
         # IPX encapsulation - use encryption instead of token
-        prompt_boolean "Enable Encryption" "true" CONFIG[enable_encryption]
+        prompt_advanced_boolean "Enable Encryption" "true" CONFIG[enable_encryption] || return 1
 
         if [[ "${CONFIG[enable_encryption]}" == "true" ]]; then
             echo
             while true; do
                 colorize magenta "Available algorithms: aes-256-gcm, chacha20-poly1305, aes-128-gcm"
-                prompt_with_default "Algorithm" "aes-256-gcm" CONFIG[algorithm]
+                prompt_with_default "Algorithm" "aes-256-gcm" CONFIG[algorithm] || return 1
 
                 if is_valid_algorithm "${CONFIG[algorithm]}"; then
                     break
@@ -290,13 +495,17 @@ prompt_security_section() {
             done
 
             local generated_psk
-            generated_psk=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-            prompt_with_default "PSK (base64-encoded 32 bytes)" "$generated_psk" CONFIG[psk]
-            prompt_with_default "KDF Iterations" "100000" CONFIG[kdf_iterations]
+            [[ "$mode" == server ]] && generated_psk=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+            [[ "$mode" == client ]] && ui_hint 'Paste the same PSK used on IRAN.'
+            prompt_with_default "PSK (base64-encoded 32 bytes)" "$generated_psk" CONFIG[psk] || return 1
+            prompt_advanced "KDF Iterations" "100000" CONFIG[kdf_iterations] || return 1
         fi
     else
         # Non-IPX - use token
-        prompt_with_default "Security Token" "$(random_secret)" CONFIG[token]
+        local token_default=''
+        [[ "$mode" == server ]] && token_default=$(random_secret)
+        [[ "$mode" == client ]] && ui_hint 'Paste the same security token used on IRAN.'
+        prompt_with_default "Security Token" "$token_default" CONFIG[token] || return 1
         CONFIG[enable_encryption]="false"
     fi
     echo ""
@@ -307,17 +516,32 @@ prompt_transport_section() {
     local mode="$1"
     local is_ipx="false"
 
-    colorize blue "━━━ Transport Configuration ━━━" bold
+    ui_section "Transport Configuration"
 
     # Transport type selection
     local valid_transports=(tcp tcpmux xtcpmux ws wss wsmux wssmux xwsmux anytls tun)
-    echo "Available transports:"
-    printf '  • %s\n' "${valid_transports[@]}"
+    ui_hint 'Enter a number or a transport name. Enter selects TCP.'
+    ui_item 1 'tcp       Simple TCP tunnel (default)'
+    ui_item 2 'tcpmux    TCP with multiple streams'
+    ui_item 3 'xtcpmux   Extended TCP multiplexing'
+    ui_item 4 'ws        WebSocket'
+    ui_item 5 'wss       WebSocket with TLS'
+    ui_item 6 'wsmux     WebSocket with multiple streams'
+    ui_item 7 'wssmux    TLS WebSocket with multiple streams'
+    ui_item 8 'xwsmux    Extended WebSocket multiplexing'
+    ui_item 9 'anytls    AnyTLS'
+    ui_item 10 'tun       Virtual interface / IPX (advanced)'
 
     while true; do
         echo -ne "Select transport: "
-        read -r CONFIG[transport_type]
-        [[ " ${valid_transports[*]} " =~ " ${CONFIG[transport_type]} " ]] && break
+        read -r CONFIG[transport_type] || return 1
+        [[ "${CONFIG[transport_type]}" == /cancel ]] && return 1
+        CONFIG[transport_type]="${CONFIG[transport_type],,}"
+        CONFIG[transport_type]="${CONFIG[transport_type]:-tcp}"
+        if [[ "${CONFIG[transport_type]}" =~ ^[0-9]{1,2}$ ]] && ((10#${CONFIG[transport_type]} >= 1 && 10#${CONFIG[transport_type]} <= 10)); then
+            CONFIG[transport_type]="${valid_transports[$((10#${CONFIG[transport_type]}-1))]}"
+        fi
+        valid_choice "${valid_transports[*]}" "${CONFIG[transport_type]}" && break
         colorize red "Invalid transport."
     done
 
@@ -330,8 +554,15 @@ prompt_transport_section() {
 
           while true; do
               echo -ne "Select encapsulation: "
-              read -r CONFIG[tun_encapsulation]
-              [[ " ${encapsulations[*]} " =~ " ${CONFIG[tun_encapsulation]} " ]] && break
+              read -r CONFIG[tun_encapsulation] || return 1
+              [[ "${CONFIG[tun_encapsulation]}" == /cancel ]] && return 1
+              CONFIG[tun_encapsulation]="${CONFIG[tun_encapsulation],,}"
+              case "${CONFIG[tun_encapsulation]}" in
+                  ''|1) CONFIG[tun_encapsulation]=tcp ;;
+                  2) CONFIG[tun_encapsulation]=ipx ;;
+                  3) CONFIG[tun_encapsulation]=ipx-spoof ;;
+              esac
+              valid_choice "${encapsulations[*]}" "${CONFIG[tun_encapsulation]}" && break
               colorize red "Invalid encapsulation."
           done
     fi
@@ -352,24 +583,24 @@ prompt_transport_section() {
 
     # Nodelay - except ipx
     if [[ "$is_ipx" != "true" ]]; then
-        prompt_boolean "Enable TCP_NODELAY" "true" CONFIG[nodelay]
+        prompt_advanced_boolean "Enable TCP_NODELAY" "true" CONFIG[nodelay] || return 1
     fi
 
     # Mode-specific options
     if [[ "$mode" == "server" ]]; then
         # Accept UDP - only for tcp transport
         if [[ "${CONFIG[transport_type]}" == "tcp" ]]; then
-            prompt_boolean "Accept UDP over TCP" "false" CONFIG[accept_udp]
+            prompt_advanced_boolean "Accept UDP over TCP" "false" CONFIG[accept_udp] || return 1
         fi
 
         # Proxy Protocol - except tun, ipx, ws
         if [[ ! "${CONFIG[transport_type]}" =~ ^(tun|ws)$ ]] && [[ "$is_ipx" != "true" ]]; then
-            prompt_boolean "Enable Proxy Protocol" "false" CONFIG[proxy_protocol]
+            prompt_advanced_boolean "Enable Proxy Protocol" "false" CONFIG[proxy_protocol] || return 1
         fi
     else
         # Connection pool - except tun
         if [[ "${CONFIG[transport_type]}" != "tun" ]]; then
-            prompt_with_default "Connection Pool" "8" CONFIG[connection_pool]
+            prompt_advanced "Connection Pool" "8" CONFIG[connection_pool] || return 1
         fi
     fi
 
@@ -393,9 +624,9 @@ prompt_mux_section() {
         return
     fi
 
-    colorize blue "━━━ Mux Configuration ━━━" bold
-    prompt_with_default "Mux Version [1 or 2]" "2" CONFIG[mux_version]
-    prompt_with_default "Mux Concurrency" "8" CONFIG[mux_concurrency]
+    ui_section "Mux Configuration"
+    prompt_advanced "Mux Version [1 or 2]" "2" CONFIG[mux_version] || return 1
+    prompt_advanced "Mux Concurrency" "8" CONFIG[mux_concurrency] || return 1
     CONFIG[mux_framesize]="32768"
     CONFIG[mux_recievebuffer]="4194304"
     CONFIG[mux_streambuffer]="2097152"
@@ -410,9 +641,9 @@ prompt_tun_section() {
 
     [[ "$transport" != "tun" ]] && return
 
-    colorize blue "━━━ TUN Configuration ━━━" bold
+    ui_section "TUN Configuration"
 
-    prompt_with_default "TUN Device Name" "bh" CONFIG[tun_name]
+    prompt_with_default "TUN Device Name" "bh" CONFIG[tun_name] || return 1
 
     # Local and Remote addresses with CIDR validation
     # Server: local=10.10.10.3/24, remote=10.10.10.4/24
@@ -427,28 +658,27 @@ prompt_tun_section() {
     fi
 
     while true; do
-        prompt_with_default "TUN Local Address (CIDR)" "$default_local" CONFIG[tun_local_addr]
+        prompt_with_default "TUN Local Address (CIDR)" "$default_local" CONFIG[tun_local_addr] || return 1
         if validate_cidr "${CONFIG[tun_local_addr]}"; then
             break
         fi
-        local suggested=$(validate_cidr "${CONFIG[tun_local_addr]}" 2>&1)
-        colorize red "Invalid CIDR. Network address should be: $suggested"
+        colorize red 'Enter a host CIDR such as 10.10.10.1/24, not a network/broadcast address.'
     done
 
     while true; do
-        prompt_with_default "TUN Remote Address (CIDR)" "$default_remote" CONFIG[tun_remote_addr]
+        prompt_with_default "TUN Remote Address (CIDR)" "$default_remote" CONFIG[tun_remote_addr] || return 1
         if validate_cidr "${CONFIG[tun_remote_addr]}"; then
             break
         fi
         colorize red "Invalid CIDR format."
     done
 
-    prompt_with_default "Health Port" "1234" CONFIG[tun_health_port]
+    prompt_with_default "Health Port" "1234" CONFIG[tun_health_port] || return 1
 
     if [[ "$is_ipx" == "true" ]]; then
-        prompt_with_default "MTU" "1320" CONFIG[tun_mtu]
+        prompt_with_default "MTU" "1320" CONFIG[tun_mtu] || return 1
     else
-        prompt_with_default "MTU" "1500" CONFIG[tun_mtu]
+        prompt_with_default "MTU" "1500" CONFIG[tun_mtu] || return 1
     fi
     echo ""
 }
@@ -462,9 +692,9 @@ prompt_tls_section() {
         return
     fi
 
-    colorize blue "━━━ TLS Configuration ━━━" bold
+    ui_section "TLS Configuration"
     if [[ "$transport" == "anytls" ]]; then
-        prompt_with_default "SNI" "www.digikala.com" CONFIG[tls_sni]
+        prompt_with_default "SNI" "www.digikala.com" CONFIG[tls_sni] || return 1
     fi
 
     if [[ "$mode" == "client" ]]; then
@@ -474,15 +704,18 @@ prompt_tls_section() {
 
     # Generate cert/key if missing
     if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
-        colorize red "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
-        openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out  "$CERT_FILE" -subj "/CN=bh.local"
+        colorize yellow 'Generating a self-signed P-256 TLS certificate...'
+        generate_tls_certificate "$CERT_FILE" "$KEY_FILE" || return 1
         colorize green "[*] Generated $CERT_FILE and $KEY_FILE"
         echo
     fi
 
     # Prompt for cert/key paths with defaults pointing to generated files
-    prompt_with_default "TLS Certificate Path" "$CERT_FILE" CONFIG[tls_cert]
-    prompt_with_default "TLS Key Path" "$KEY_FILE" CONFIG[tls_key]
+    prompt_advanced "TLS Certificate Path" "$CERT_FILE" CONFIG[tls_cert] || return 1
+    prompt_advanced "TLS Key Path" "$KEY_FILE" CONFIG[tls_key] || return 1
+    [[ -r "${CONFIG[tls_cert]}" && -r "${CONFIG[tls_key]}" ]] || {
+        colorize red 'Certificate/key files are not readable.'; return 1;
+    }
     echo ""
 }
 
@@ -491,15 +724,25 @@ prompt_tuning_section() {
     local is_ipx="$1"
     local is_tun="$2"
 
-    colorize blue "━━━ Tuning Configuration ━━━" bold
-    prompt_boolean "Enable Auto Tuning" "true" CONFIG[auto_tuning]
+    if [[ "${setup_style:-advanced}" == quick ]]; then
+        CONFIG[auto_tuning]=true; CONFIG[tuning_profile]=balanced; CONFIG[workers]=0
+        CONFIG[channel_size]=4096; CONFIG[so_sndbuf]=0
+        [[ "$is_tun" == true ]] && CONFIG[channel_size]=10000
+        if [[ "$is_ipx" == true ]]; then CONFIG[batch_size]=2048;
+        else CONFIG[tcp_mss]=0; CONFIG[so_rcvbuf]=0; fi
+        if [[ "$is_tun" != true ]]; then CONFIG[buffer_profile]=balanced; CONFIG[read_timeout]=120; fi
+        return 0
+    fi
+
+    ui_section "Tuning Configuration"
+    prompt_advanced_boolean "Enable Auto Tuning" "true" CONFIG[auto_tuning] || return 1
     echo
     colorize magenta "Profiles: balanced, fast, latency, resource" normal
-    prompt_with_default "Kernel Tuning Profile" "balanced" CONFIG[tuning_profile]
-    prompt_with_default "Workers (0 = auto)" "0" CONFIG[workers]
+    prompt_advanced "Kernel Tuning Profile" "balanced" CONFIG[tuning_profile] || return 1
+    prompt_advanced "Workers (0 = auto)" "0" CONFIG[workers] || return 1
 
     if [[ "$is_tun" != "true" ]]; then
-        prompt_with_default "Channel Size" "4096" CONFIG[channel_size]
+        prompt_advanced "Channel Size" "4096" CONFIG[channel_size] || return 1
     fi
 
     if [[ "$is_tun" == "true" ]]; then
@@ -508,20 +751,20 @@ prompt_tuning_section() {
 
     # Batch size - for ipx
     if [[ "$is_ipx" == "true" ]]; then
-        prompt_with_default "Batch Size" "2048" CONFIG[batch_size]
-        prompt_with_default "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf]
+        prompt_advanced "Batch Size" "2048" CONFIG[batch_size] || return 1
+        prompt_advanced "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf] || return 1
     else
-        prompt_with_default "TCP MSS (0 = auto)" "0" CONFIG[tcp_mss]
-        prompt_with_default "SO_RCVBUF (0 = auto)" "0" CONFIG[so_rcvbuf]
-        prompt_with_default "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf]
+        prompt_advanced "TCP MSS (0 = auto)" "0" CONFIG[tcp_mss] || return 1
+        prompt_advanced "SO_RCVBUF (0 = auto)" "0" CONFIG[so_rcvbuf] || return 1
+        prompt_advanced "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf] || return 1
     fi
 
     # Read timeout - except tun, ipx
     if [[ "$is_tun" != "true" ]] && [[ "$is_ipx" != "true" ]]; then
         echo
         colorize magenta "Buffer Profiles: extreme_low_cpu, ultra_low_cpu, low_cpu, balanced, low_memory" normal
-        prompt_with_default "Buffer Profile" "balanced" CONFIG[buffer_profile]
-        prompt_with_default "Read Timeout" "120" CONFIG[read_timeout]
+        prompt_advanced "Buffer Profile" "balanced" CONFIG[buffer_profile] || return 1
+        prompt_advanced "Read Timeout" "120" CONFIG[read_timeout] || return 1
     fi
 
     #CONFIG[max_connections]="0"
@@ -530,9 +773,10 @@ prompt_tuning_section() {
 
 # Section: Logging
 prompt_logging_section() {
-    colorize blue "━━━ Logging Configuration ━━━" bold
+    if [[ "${setup_style:-advanced}" == quick ]]; then CONFIG[log_level]=info; return 0; fi
+    ui_section "Logging Configuration"
     colorize magenta "Levels: panic, fatal, error, warn, info, debug, trace"
-    prompt_with_default "Log Level" "info" CONFIG[log_level]
+    prompt_advanced "Log Level" "info" CONFIG[log_level] || return 1
     echo ""
 }
 
@@ -550,46 +794,34 @@ prompt_accept_udp_section() {
 
 # Section: Ports
 prompt_ports_section() {
-    local mode="$1"
-    local is_tun="$2"
-
-  [[ "$mode" != "server" ]] && return
-
-    if [[ "$is_tun" != "true" ]]; then
-        colorize blue "━━━ Port Mapping Configuration ━━━" bold
-        colorize green "Supported formats:"
-        echo "  1. 443           - Listen on 443, forward to 443"
-        echo "  2. 443=5000      - Listen on 443, forward to 5000"
-        echo "  3. 443-600       - Listen on range 443-600"
-        echo "  4. 443-600:5201  - Range forwarding to 5201"
-        echo ""
-
-        echo -ne "Enter port mappings (comma-separated): "
-        read -r CONFIG[ports_mapping]
-        echo ""
-
-    else
-        colorize blue "━━━ Port Mapping Configuration (tun helper) ━━━" bold
-        colorize magenta "Forwarder: use 'BH' for TCP support only, or 'iptables' for TCP + UDP support"
+    local mode="$1" is_tun="$2" edit_mode=server
+    [[ "$mode" != server ]] && return 0
+    ui_section 'Forward your application ports'
+    ui_hint '443 = same port on both servers; 8443=443 = IRAN 8443 to KHAREJ 443.'
+    [[ "$is_tun" != true ]] && ui_hint 'Ranges also work: 5000-5010 or 5000-5010:5201.'
+    if [[ "$is_tun" == true ]]; then
         while true; do
-            prompt_with_default "Forwarder (BH/iptables)" "BH" CONFIG[forwarder]
+            prompt_advanced 'Forwarder (BH for TCP / iptables for TCP + UDP)' BH CONFIG[forwarder] || return 1
             case "${CONFIG[forwarder],,}" in
                 bh|backhaul) CONFIG[forwarder]=backhaul; break ;;
                 iptables) CONFIG[forwarder]=iptables; break ;;
                 *) colorize red 'Choose BH or iptables.' ;;
             esac
         done
-        echo ""
-        colorize green "Supported formats:"
-        echo "  1. 443           - Listen on 443, forward to 443"
-        echo "  2. 443=5000      - Listen on 443, forward to 5000"
-        echo ""
-
-        echo -ne "Enter port mappings (comma-separated): "
-        read -r CONFIG[ports_mapping]
-        echo ""
-
     fi
+    local previous_type="${EDIT_VALUES[transport.type]-}"
+    EDIT_VALUES[transport.type]="\"${CONFIG[transport_type]}\""
+    while true; do
+        prompt_with_default 'Application ports (comma-separated)' '' CONFIG[ports_mapping] || {
+            if [[ -n "$previous_type" ]]; then EDIT_VALUES[transport.type]="$previous_type";
+            else unset 'EDIT_VALUES[transport.type]'; fi
+            return 1
+        }
+        if [[ -n "${CONFIG[ports_mapping]// /}" ]] && edit_valid_mappings "${CONFIG[ports_mapping]}"; then break; fi
+        colorize red 'Enter ports 1-65535, pairs, or ascending ranges. At least one mapping is required.'
+    done
+    if [[ -n "$previous_type" ]]; then EDIT_VALUES[transport.type]="$previous_type";
+    else unset 'EDIT_VALUES[transport.type]'; fi
 }
 
 
@@ -600,7 +832,7 @@ prompt_ipx_section() {
 
     [[ "$is_ipx" != "true" ]] && return
 
-    colorize blue "━━━ IPX Configuration ━━━" bold
+    ui_section "IPX Configuration"
 
     CONFIG[ipx_mode]="$mode"
 
@@ -612,7 +844,7 @@ prompt_ipx_section() {
 
     while true; do
         # Prompt user with default
-        prompt_with_default "Profile" "tcp" CONFIG[ipx_profile]
+        prompt_with_default "Profile" "tcp" CONFIG[ipx_profile] || return 1
 
         # Normalize to lowercase
         CONFIG[ipx_profile]="${CONFIG[ipx_profile],,}"
@@ -630,10 +862,10 @@ prompt_ipx_section() {
     done
 
 
-    prompt_with_default "Listen IP" $SERVER_IP CONFIG[ipx_listen_ip]
+    prompt_with_default "Listen IP" "$SERVER_IP" CONFIG[ipx_listen_ip] || return 1
 
     while :; do
-        prompt_with_default "Destination IP" "" CONFIG[ipx_dst_ip]
+        prompt_with_default "Destination IP" "" CONFIG[ipx_dst_ip] || return 1
 
         if [[ -n "${CONFIG[ipx_dst_ip]}" ]]; then
             break
@@ -648,7 +880,7 @@ prompt_ipx_section() {
         local field
         for field in spoof_src_ip spoof_dst_ip; do
             while true; do
-                prompt_with_default "$field (whitelisted IPv4)" "" "CONFIG[ipx_$field]"
+                prompt_with_default "$field (whitelisted IPv4)" "" "CONFIG[ipx_$field]" || return 1
                 valid_ipv4 "${CONFIG[ipx_$field]}" && break
                 colorize red 'Enter a valid IPv4 address.'
             done
@@ -656,12 +888,12 @@ prompt_ipx_section() {
     fi
 
     local interface
-    interface=$(ip route show default | awk '{print $5}')
-    prompt_with_default "Network Interface" $interface CONFIG[ipx_interface]
+    interface=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    prompt_with_default "Network Interface" "$interface" CONFIG[ipx_interface] || return 1
 
     if [[ "${CONFIG[ipx_profile]}" == "icmp" ]]; then
-        prompt_with_default "ICMP Type" "0" CONFIG[ipx_icmp_type]
-        prompt_with_default "ICMP Code" "0" CONFIG[ipx_icmp_code]
+        prompt_with_default "ICMP Type" "0" CONFIG[ipx_icmp_type] || return 1
+        prompt_with_default "ICMP Code" "0" CONFIG[ipx_icmp_code] || return 1
     fi
     echo ""
 }
@@ -833,96 +1065,76 @@ generate_toml_config() {
 # ============================================================================
 
 configure_server() {
-    local mode="$1"  # server or client
-    local mode_name
-
-    if [[ "$mode" == "server" ]]; then
-        mode_name="IRAN (Server)"
-    else
-        mode_name="KHAREJ (Client)"
-    fi
-
-    clear
-    colorize cyan "Configuring $mode_name" bold
-    echo ""
-
-    # Reset configuration
+    local mode="$1" setup_style="${2:-quick}" mode_name edit_mode="$1"
+    [[ "$mode" == server ]] && mode_name='IRAN / Server' || mode_name='KHAREJ / Client'
+    ui_header "New tunnel · $mode_name" 'Enter accepts defaults. Type /cancel at any setup prompt to go back.'
     reset_config
-
-    # Prompt all sections
-
-    # Determine if IPX encapsulation (we'll know after transport selection)
-    # For now, assume non-IPX, will update if tun+ipx is selected
-
-    prompt_transport_section "$mode"
-
-    # Check if TUN transport
-    local is_tun="false"
-    local is_ipx="false"
-    [[ "${CONFIG[transport_type]}" == "tun" ]] && is_tun="true"
-    [[ "${CONFIG[tun_encapsulation]}" == "ipx" ]] && is_ipx="true"
-
-    prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx"
-    prompt_ipx_section "$is_ipx" "$mode"
-
-    if [[ "$is_ipx" != "true" ]]; then
-        prompt_connection_section "$mode"
+    ui_section 'STEP 1 / 4 · Connection type'
+    prompt_transport_section "$mode" || return 0
+    local is_tun=false is_ipx=false
+    [[ "${CONFIG[transport_type]}" == tun ]] && is_tun=true
+    [[ "${CONFIG[tun_encapsulation]}" == ipx ]] && is_ipx=true
+    if [[ "$is_tun" == true ]]; then
+        if [[ ! -c /dev/net/tun ]] || ! command -v ip >/dev/null; then
+            colorize red 'TUN needs /dev/net/tun and iproute2 on this server.'; press_key; return 1
+        fi
     fi
+    ui_section 'STEP 2 / 4 · Server addresses'
+    prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx" || return 0
+    prompt_ipx_section "$is_ipx" "$mode" || return 0
+    if [[ "$is_ipx" != true ]]; then prompt_connection_section "$mode" || return 0; fi
+    ui_section 'STEP 3 / 4 · Security and application ports'
+    prompt_security_section "$is_ipx" "$mode" || return 0
+    prompt_accept_udp_section "${CONFIG[accept_udp]}" || return 0
+    prompt_mux_section "${CONFIG[transport_type]}" || return 0
+    prompt_tls_section "$mode" "${CONFIG[transport_type]}" || return 0
+    prompt_tuning_section "$is_ipx" "$is_tun" || return 0
+    prompt_logging_section || return 0
+    prompt_ports_section "$mode" "$is_tun" || return 0
 
-    prompt_security_section "$is_ipx"
-
-    prompt_accept_udp_section "${CONFIG[accept_udp]}"
-    prompt_mux_section "${CONFIG[transport_type]}"
-    prompt_tls_section "$mode" "${CONFIG[transport_type]}"
-    prompt_tuning_section "$is_ipx" "$is_tun"
-    prompt_logging_section
-    prompt_ports_section "$mode" "$is_tun"
-
-    # Determine tunnel port
-    local tunnel_port
-    if [[ "$is_ipx" == true ]]; then
-        tunnel_port="${CONFIG[tun_health_port]}"
-    elif [[ "$mode" == "server" ]]; then
-        tunnel_port="${CONFIG[bind_addr]##*:}"
-    else
-        tunnel_port="${CONFIG[remote_addr]##*:}"
+    local tunnel_port config_file service_type service temporary
+    if [[ "$is_ipx" == true ]]; then tunnel_port="${CONFIG[tun_health_port]}";
+    elif [[ "$mode" == server ]]; then tunnel_port="${CONFIG[bind_addr]##*:}";
+    else tunnel_port="${CONFIG[remote_addr]##*:}"; fi
+    valid_port "$tunnel_port" || { colorize red 'Tunnel port must be 1-65535.'; press_key; return 1; }
+    tunnel_port="$((10#$tunnel_port))"
+    [[ "$mode" == server ]] && service_type=iran || service_type=kharej
+    config_file="$config_dir/${service_type}${tunnel_port}.toml"
+    service="backhaul-${service_type}${tunnel_port}.service"
+    if [[ -e "$config_file" || -e "$service_dir/$service" ]]; then
+        colorize red 'A tunnel already uses this name/port. Open My tunnels to edit it.'; press_key; return 1
     fi
-    if [[ ! "$tunnel_port" =~ ^[0-9]{1,5}$ ]] || ((10#$tunnel_port < 1 || 10#$tunnel_port > 65535)); then
-        colorize red 'Tunnel port must be 1-65535.'; press_key; return 1
-    fi
-
-    # Generate config file
-    local config_file
-    if [[ "$mode" == "server" ]]; then
-        config_file="${config_dir}/iran${tunnel_port}.toml"
-    else
-        config_file="${config_dir}/kharej${tunnel_port}.toml"
-    fi
-
-    # Create systemd service
-    local service_type
-    [[ "$mode" == "server" ]] && service_type="iran" || service_type="kharej"
-    if [[ -e "$config_file" || -e "$service_dir/backhaul-${service_type}${tunnel_port}.service" ]]; then
-        colorize red 'A tunnel already uses this name/port. Use Tunnel management → Edit instead.'
-        press_key; return 1
-    fi
-    local temporary
     temporary=$(mktemp "$config_dir/.setup.XXXXXX") || return 1
     if ! generate_toml_config "$mode" "$temporary" "$is_tun" "$is_ipx" ||
-       ! edit_load_config "$temporary" || ! chmod 600 "$temporary" || ! ln "$temporary" "$config_file"; then
+       ! edit_load_config "$temporary" || ! validate_config_settings ||
+       ! check_tun_conflict "$config_file"; then
         rm -f "$temporary"
-        colorize red 'Invalid settings or configuration could not be saved.'; press_key; return 1
+        colorize red 'The settings could not be validated. No tunnel was created.'; press_key; return 1
+    fi
+    ui_section 'STEP 4 / 4 · Review and start'
+    show_config_summary
+    ui_hint "Config: $config_file"
+    if ! ui_confirm 'Create and start this tunnel?'; then
+        rm -f "$temporary"; return 0
+    fi
+    if ! chmod 600 "$temporary" || ! ln "$temporary" "$config_file"; then
+        rm -f "$temporary"; colorize red 'Could not save the configuration.'; press_key; return 1
     fi
     rm -f "$temporary"
-    create_systemd_service "$service_type" "$tunnel_port" "$config_file" || { press_key; return 1; }
-
-    echo ""
-    colorize green "✔ Configuration completed successfully!" bold
-    if [[ "$mode" == server ]]; then
-        echo 'KHAREJ setup link (contains credentials; keep private):'
-        peer_setup_link "$config_file"
+    if ! create_systemd_service "$service_type" "$tunnel_port" "$config_file"; then
+        systemctl disable --now "$service" >/dev/null 2>&1
+        rm -f "$config_file" "$service_dir/$service"
+        systemctl daemon-reload
+        colorize red 'Setup failed. The new config and service were removed.'; press_key; return 1
     fi
-    echo ""
+    ui_section 'Your tunnel is ready'
+    if [[ "$mode" == server ]]; then
+        ui_hint 'Next: run BH on KHAREJ, choose New tunnel > Paste setup link.'
+        ui_hint 'The setup link contains credentials. Keep it private.'
+        peer_setup_link "$config_file"
+    else
+        ui_hint 'Use My tunnels > Test connection to verify traffic through both servers.'
+    fi
     press_key
 }
 
@@ -963,6 +1175,8 @@ edit_load_config() {
     local file="$1" line section="" key value normalized pending="" number=0
     local section_pattern='^\[([a-zA-Z_][a-zA-Z0-9_]*)\]$'
     local field_pattern='^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$'
+    local -A seen_sections=()
+    [[ -r "$file" ]] || { colorize red "Cannot read configuration: $file"; return 1; }
     EDIT_VALUES=()
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((number+=1))
@@ -972,6 +1186,10 @@ edit_load_config() {
             value+="$line"
         elif [[ "$line" =~ $section_pattern ]]; then
             section="${BASH_REMATCH[1]}"
+            [[ -z "${seen_sections[$section]+present}" ]] || {
+                colorize red "Duplicate section at line $number. File unchanged."; return 1;
+            }
+            seen_sections[$section]=true
             continue
         elif [[ -n "$section" && "$line" =~ $field_pattern ]]; then
             key="${BASH_REMATCH[1]}"
@@ -1200,6 +1418,7 @@ edit_valid_mappings() {
     local -a mappings parts
     input="${input// /}"
     [[ -z "$input" ]] && return 0
+    [[ "$input" != ,* && "$input" != *, && "$input" != *,,* ]] || return 1
     IFS=',' read -r -a mappings <<< "$input"
     for mapping in "${mappings[@]}"; do
         if [[ "$(edit_value transport.type)" == tun ]]; then
@@ -1227,7 +1446,7 @@ edit_prompt_field() {
     type=$(printf '%s' "${EDIT_VALUES[$id]:-$default}" | jq -r type)
     choices=$(edit_choices "$id")
     echo
-    colorize cyan "$(edit_label "${id#*.}"): $current" bold
+    colorize cyan "$(edit_label "${id#*.}"): $(edit_preview_value "$id" "$default")" bold
     echo 'Press Enter to keep the displayed value.'
     if [[ "$type" == boolean ]]; then
         options=(true false)
@@ -1247,13 +1466,14 @@ edit_prompt_field() {
         echo 'Use - to clear the optional edge address.'
     fi
     while true; do
-        read -r -p 'New value: ' input || return 1
+        read -r -p 'New value (/cancel to go back): ' input || return 1
+        [[ "$input" == /cancel ]] && return 1
         if [[ -z "$input" ]]; then input="$current"; fi
         if ((${#options[@]})); then
-            if [[ "$input" =~ ^[0-9]+$ ]] && ((10#$input >= 1 && 10#$input <= ${#options[@]})); then
+            if [[ "$input" =~ ^[0-9]{1,3}$ ]] && ((10#$input >= 1 && 10#$input <= ${#options[@]})); then
                 input="${options[$((10#$input-1))]}"
             fi
-            if [[ " ${options[*]} " != *" $input "* ]]; then
+            if ! valid_choice "${options[*]}" "$input"; then
                 colorize red 'Choose one of the listed options.'; continue
             fi
         fi
@@ -1275,6 +1495,10 @@ edit_prompt_field() {
                 valid_ipv4 "$input" || { colorize red 'Enter a valid IPv4 address.'; continue; } ;;
             dialer.edge_ip) [[ "$input" == - ]] && input="" ;;
         esac
+        [[ "$type" == number ]] && input="${input//_/}"
+        if ! validate_setting "$id" "$input"; then
+            colorize red "Invalid value for $(edit_label "${id#*.}"). Try again."; continue
+        fi
         case "$type" in
             boolean) encoded="$input" ;;
             number)
@@ -1382,8 +1606,7 @@ edit_section_menu() {
     local -a keys defaults
     while true; do
         keys=(); defaults=()
-        echo
-        colorize cyan "$(edit_label "$section")" bold
+        ui_header "EDIT / $(edit_label "$section")" 'Select a setting. Values apply only after Save.'
         while IFS='|' read -r key default; do
             keys+=("$key"); defaults+=("$default")
         done < <(edit_fields "$section")
@@ -1395,7 +1618,7 @@ edit_section_menu() {
             keys+=("$key"); defaults+=("${EDIT_VALUES[$id]}")
         done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
         for i in "${!keys[@]}"; do
-            printf ' %s) %s: %s\n' "$((i+1))" "$(edit_label "${keys[$i]}")" "$(edit_display_value "$section.${keys[$i]}" "${defaults[$i]}")"
+            ui_item "$((i+1))" "$(edit_label "${keys[$i]}") · $(edit_preview_value "$section.${keys[$i]}" "${defaults[$i]}")"
         done
         echo ' 0) Back'
         read -r -p 'Select a setting to change: ' choice || return 1
@@ -1430,12 +1653,12 @@ edit_write_config() {
 
 edit_save_config() {
     local file="$1" service="$2" temporary cert key
+    validate_config_settings && check_tun_conflict "$file" || return 1
     cert=$(edit_value tls.tls_cert); key=$(edit_value tls.tls_key)
     if [[ "$edit_mode" == server && " ${EDIT_SECTIONS[*]} " == *' tls '* ]]; then
         if [[ "$cert" == "$CERT_FILE" && "$key" == "$KEY_FILE" && ( ! -f "$cert" || ! -f "$key" ) ]]; then
             colorize yellow 'Generating the default TLS certificate and key...'
-            openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 \
-                -keyout "$key" -out "$cert" -subj '/CN=bh.local' || return 1
+            generate_tls_certificate "$cert" "$key" || return 1
         fi
         if [[ ! -f "$cert" || ! -f "$key" ]]; then
             colorize red 'TLS certificate/key not found. Set valid paths before saving.'
@@ -1468,18 +1691,16 @@ edit_tunnel() {
     edit_load_config "$file" || { press_key; return 1; }
     while true; do
         edit_sections
-        echo
-        colorize cyan "Edit $config_name — $(edit_value transport.type)" bold
-        echo 'Choose a group, then a setting. Changes apply only when you save.'
+        ui_header "EDIT / $config_name" 'Choose a group. Save applies changes and restarts this tunnel.'
+        show_config_summary
+        ui_section 'SETTINGS'
         for i in "${!EDIT_SECTIONS[@]}"; do
             section="${EDIT_SECTIONS[$i]}"
-            printf ' %s) %s\n' "$((i+1))" "$(edit_label "$section")"
-            while IFS= read -r id; do
-                [[ "$id" == "$section."* ]] && printf '    %s: %s\n' "$(edit_label "${id#*.}")" "$(edit_display_value "$id")"
-            done < <(printf '%s\n' "${!EDIT_VALUES[@]}" | sort)
+            ui_item "$((i+1))" "$(edit_label "$section")"
         done
-        echo ' s) Save changes and restart tunnel'
-        echo ' 0) Cancel (discard edits)'
+        ui_rule
+        ui_item s 'Save changes & restart'
+        ui_item 0 'Back · discard unsaved edits'
         read -r -p 'Select an option: ' choice || return 1
         case "$choice" in
             0) return 0 ;;
@@ -1505,12 +1726,16 @@ create_systemd_service() {
     local config_file="$3"
 
     local service_file="${service_dir}/backhaul-${type}${port}.service"
-    local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+    local desc_type="${type^^}" temporary
+    [[ "$type" == iran || "$type" == kharej ]] && valid_port "$port" || return 1
+    [[ ! -e "$service_file" ]] || { colorize red 'Service already exists. Use My tunnels.'; return 1; }
+    temporary=$(mktemp "$service_dir/.bh-service.XXXXXX") || return 1
 
-    cat > "$service_file" <<EOF
+    if ! cat > "$temporary" <<EOF
 [Unit]
 Description=BH $desc_type Port $port
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -1527,6 +1752,13 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$temporary"; return 1
+    fi
+    if ! chmod 644 "$temporary" || ! ln "$temporary" "$service_file"; then
+        rm -f "$temporary"; colorize red 'Could not save the service file.'; return 1
+    fi
+    rm -f "$temporary"
 
     if ! systemctl daemon-reload || ! systemctl enable --now "backhaul-${type}${port}.service" ||
        ! sleep 1 || ! systemctl is-active --quiet "backhaul-${type}${port}.service"; then
@@ -1535,6 +1767,116 @@ EOF
     fi
 
     colorize green "✔ BH service ${type}${port} created and started" bold
+}
+
+generate_tls_certificate() {
+    local cert="$1" key="$2" temporary
+    command -v openssl >/dev/null || { colorize red 'Install openssl to use TLS.'; return 1; }
+    mkdir -p "$CERT_DIR" || return 1
+    temporary=$(mktemp -d "$CERT_DIR/.tls.XXXXXX") || return 1
+    if ! openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 \
+        -keyout "$temporary/key" -out "$temporary/cert" -subj '/CN=bh.local' >/dev/null 2>&1 ||
+       ! chmod 600 "$temporary/key" || ! chmod 644 "$temporary/cert" ||
+       ! mv -f "$temporary/key" "$key" || ! mv -f "$temporary/cert" "$cert"; then
+        rm -rf "$temporary"; colorize red 'Could not generate the TLS certificate/key.'; return 1
+    fi
+    rm -rf "$temporary"
+}
+
+validate_config_settings() {
+    local id value choices section key default expected actual
+    local -A types=()
+    edit_sections
+    for section in "${EDIT_SECTIONS[@]}"; do
+        while IFS='|' read -r key default; do
+            types[$section.$key]=$(printf '%s' "$default" | jq -r type)
+        done < <(edit_fields "$section")
+    done
+    for id in "${!EDIT_VALUES[@]}"; do
+        [[ -n "${types[$id]-}" ]] || continue
+        expected="${types[$id]}"
+        actual=$(printf '%s' "${EDIT_VALUES[$id]}" | jq -r type)
+        value=$(edit_value "$id")
+        [[ "$expected" == "$actual" ]] && validate_setting "$id" "$value" || {
+            colorize red "Invalid setting: $id"; return 1;
+        }
+        choices=$(edit_choices "$id")
+        [[ "$id" == ports.forwarder && "$value" == backhaul ]] && value=BH
+        [[ -z "$choices" ]] || valid_choice "$choices" "$value" || {
+            colorize red "Invalid choice: $id"; return 1;
+        }
+    done
+    if [[ "$(edit_value tun.encapsulation)" == ipx ]]; then
+        for id in ipx.listen_ip ipx.dst_ip ipx.interface; do
+            validate_setting "$id" "$(edit_value "$id")" || { colorize red "Missing/invalid $id"; return 1; }
+        done
+        if [[ "$(edit_value security.enable_encryption)" == true ]]; then
+            valid_psk "$(edit_value security.psk)" || { colorize red 'IPX needs a base64-encoded 32-byte PSK.'; return 1; }
+        fi
+        if [[ "$(edit_value ipx.custom_packet)" == true ]]; then
+            valid_ipv4 "$(edit_value ipx.spoof_src_ip)" && valid_ipv4 "$(edit_value ipx.spoof_dst_ip)" || return 1
+        fi
+    else
+        [[ "$edit_mode" == server ]] && id=listener.bind_addr || id=dialer.remote_addr
+        validate_setting "$id" "$(edit_value "$id")" && [[ -n "$(edit_value security.token)" ]] || {
+            colorize red 'A valid connection address and shared security token are required.'; return 1;
+        }
+    fi
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        for id in tun.local_addr tun.remote_addr tun.name tun.health_port tun.mtu; do
+            validate_setting "$id" "$(edit_value "$id")" || { colorize red "Missing/invalid $id"; return 1; }
+        done
+        [[ "$(edit_value tun.local_addr)" != "$(edit_value tun.remote_addr)" ]] || {
+            colorize red 'Local and remote TUN addresses must differ.'; return 1;
+        }
+    fi
+    if [[ "$edit_mode" == server ]]; then
+        edit_valid_mappings "$(edit_value ports.mapping)" || { colorize red 'Invalid application port mapping.'; return 1; }
+    fi
+    return 0
+}
+
+check_tun_conflict() {
+    local file="$1" candidate name="${EDIT_VALUES[tun.name]-}" other
+    [[ "$(edit_value transport.type)" == tun && -n "$name" ]] || return 0
+    # Inspect with a subshell so the in-memory edits remain untouched.
+    for candidate in "$config_dir"/{iran,kharej}*.toml; do
+        [[ -f "$candidate" && "$candidate" != "$file" ]] || continue
+        other=$(edit_load_config "$candidate" >/dev/null && printf '%s' "${EDIT_VALUES[tun.name]-}")
+        if [[ "$other" == "$name" ]]; then
+            colorize red "TUN device already belongs to $(basename "${candidate%.toml}"). Choose a different device name."
+            return 1
+        fi
+    done
+    return 0
+}
+
+edit_preview_value() {
+    case "$1" in
+        security.token|security.psk) printf '[hidden · configured]' ;;
+        *)
+            local value
+            value=$(edit_display_value "$@" | LC_ALL=C tr '\001-\037\177' ' ')
+            if ((${#value} > 52)); then printf '%s…' "${value:0:49}"; else printf '%s' "$value"; fi
+            ;;
+    esac
+}
+
+show_config_summary() {
+    local endpoint count
+    endpoint=$(edit_value listener.bind_addr)
+    [[ -n "$endpoint" ]] || endpoint=$(edit_value dialer.remote_addr)
+    [[ -n "$endpoint" ]] || endpoint="$(edit_value ipx.listen_ip) → $(edit_value ipx.dst_ip)"
+    printf '  Transport    %s\n' "$(edit_preview_value transport.type)"
+    printf '  Connection   %s\n' "$endpoint"
+    if [[ "$(edit_value transport.type)" == tun ]]; then
+        printf '  TUN          %s → %s\n' "$(edit_value tun.local_addr)" "$(edit_value tun.remote_addr)"
+    fi
+    if [[ -n "${EDIT_VALUES[ports.mapping]-}" ]]; then
+        count=$(printf '%s' "${EDIT_VALUES[ports.mapping]}" | jq length)
+        printf '  Forwarding   %s mapping(s) · %s\n' "$count" "$(edit_preview_value ports.mapping)"
+    fi
+    printf '  Credentials  [hidden]\n'
 }
 
 # ============================================================================
@@ -1584,7 +1926,7 @@ decode_bh_link() {
         2) payload+='==' ;; 3) payload+='=' ;; 1) colorize red 'Link is cut short.' >&2; return 1 ;;
     esac
     decoded=$(printf '%s' "$payload" | base64 -d 2>/dev/null) || { colorize red 'Invalid link encoding.' >&2; return 1; }
-    printf '%s' "$decoded" | jq -ce 'select(type == "object" and .v == 1)' || {
+    printf '%s' "$decoded" | jq -sce 'select(length == 1) | .[0] | select(type == "object" and .v == 1)' || {
         colorize red 'Invalid or unsupported link version.' >&2; return 1;
     }
 }
@@ -1600,10 +1942,8 @@ valid_ipv4() {
 }
 
 valid_endpoint() {
-    local address="$1" port
-    [[ "$address" =~ ^([a-zA-Z0-9._-]+|\[[a-fA-F0-9:]+\]):([0-9]{1,5})$ ]] || return 1
-    port="${BASH_REMATCH[2]}"
-    ((10#$port >= 1 && 10#$port <= 65535))
+    local address="$1"
+    [[ "$address" == *:* ]] && valid_port "${address##*:}" && valid_host "${address%:*}"
 }
 
 peer_setup_link() {
@@ -1676,13 +2016,14 @@ validate_setup_settings() {
             colorize red "Unsupported setting or wrong type: $id"; return 1
         fi
         value=$(edit_value "$id")
+        validate_setting "$id" "$value" || { colorize red "Invalid setting: $id"; return 1; }
         [[ ${#value} -le 2048 ]] || { colorize red "Setting too long: $id"; return 1; }
         if [[ "$type" == number ]]; then
             printf '%s' "${EDIT_VALUES[$id]}" | jq -e '. >= 0 and . <= 2147483647 and floor == .' >/dev/null || return 1
         fi
         choices=$(edit_choices "$id")
         [[ "$id" == ports.forwarder && "$value" == backhaul ]] && value=BH
-        [[ -z "$choices" || " $choices " == *" $value "* ]] || { colorize red "Invalid choice: $id"; return 1; }
+        [[ -z "$choices" ]] || valid_choice "$choices" "$value" || { colorize red "Invalid choice: $id"; return 1; }
     done
     if [[ "$(edit_value tun.encapsulation)" != ipx ]]; then
         valid_endpoint "$(edit_value dialer.remote_addr)" || { colorize red 'Missing/invalid remote address.'; return 1; }
@@ -1749,28 +2090,17 @@ install_link_settings() {
     for id in "${!incoming[@]}"; do EDIT_VALUES[$id]="${incoming[$id]}"; done
     ((matches <= 1)) || { colorize red 'Multiple tunnels share this credential. Edit the intended tunnel manually.'; return 1; }
     edit_complete_transport || return 1
-    incoming=()
-    for id in "${!EDIT_VALUES[@]}"; do incoming[$id]="${EDIT_VALUES[$id]}"; done
+    validate_config_settings || return 1
     port="$(edit_value dialer.remote_addr)"; port="${port##*:}"
     [[ "$(edit_value tun.encapsulation)" == ipx ]] && port=$(edit_value tun.health_port)
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || return 1
+    port="$((10#$port))"
     file="${existing:-$config_dir/kharej$port.toml}"
     service="backhaul-$(basename "${file%.toml}").service"
     if [[ -z "$existing" && ( -e "$file" || -e "$service_dir/$service" ) ]]; then
         colorize red "A different tunnel already uses $file. Edit or remove it first."; return 1
     fi
-    if [[ "$(edit_value transport.type)" == tun ]]; then
-        local name="${EDIT_VALUES[tun.name]}"
-        for candidate in "$config_dir"/{iran,kharej}*.toml; do
-            [[ -f "$candidate" && "$candidate" != "$existing" ]] || continue
-            if edit_load_config "$candidate" && [[ "${EDIT_VALUES[tun.name]}" == "$name" ]]; then
-                colorize red 'Another tunnel uses this TUN device. Edit/remove it before importing.'; return 1
-            fi
-        done
-        EDIT_VALUES=()
-        for id in "${!incoming[@]}"; do EDIT_VALUES[$id]="${incoming[$id]}"; done
-        edit_sections
-    fi
+    check_tun_conflict "$file" || return 1
     colorize cyan "Setup preview: ${existing:+update }$service" bold
     echo "Transport: $(edit_value transport.type)"
     echo "IRAN address: $(edit_value dialer.remote_addr "${EDIT_VALUES[ipx.dst_ip]}")"
@@ -1798,16 +2128,17 @@ install_link_settings() {
 }
 
 setup_from_link() {
-    local raw
-    echo 'Paste the bh://1. link generated on your IRAN server.'
+    local raw result=0
+    ui_header 'KHAREJ / SETUP LINK' 'Paste the complete bh://1. link generated on IRAN. Blank returns.'
     read -r -p 'Setup link (blank to cancel): ' raw || return 1
     [[ -n "$raw" ]] || return 0
-    load_setup_link "$raw" && install_link_settings
+    load_setup_link "$raw" && install_link_settings || result=$?
     press_key
+    return "$result"
 }
 
 show_setup_link() {
-    echo 'Copy this link to KHAREJ → Configure a new tunnel → Setup from link.'
+    ui_header 'KHAREJ SETUP LINK' 'On KHAREJ: New tunnel → 2. Paste an IRAN setup link.'
     echo 'The link contains your tunnel credentials. Keep it private.'
     peer_setup_link "$1"
     press_key
@@ -2786,17 +3117,17 @@ PY_COMPARE
 test_all_transports_menu() {
     local role host coord port plan raw confirm
     [[ -x "$config_dir/backhaul_premium" ]] || { colorize red 'Install BH Core first.'; press_key; return 1; }
-    colorize cyan 'Compare all transports — ping and speed (sequential)' bold
-    echo '1) IRAN — start here and get a test link'
-    echo '2) KHAREJ — paste the IRAN test link'
-    echo '0) Back'
+    ui_header 'COMPARE TRANSPORTS' 'Ping, jitter and verified upload/download · one transport at a time.'
+    ui_item 1 'IRAN · start here and get a test link'
+    ui_item 2 'KHAREJ · paste the IRAN test link'
+    ui_item 0 'Back'
     read -r -p 'This server is: ' role || return 1
     case "$role" in
         0) return 0 ;;
         1)
-            prompt_with_default 'IRAN public IP or hostname' "$SERVER_IP" host
-            prompt_with_default 'Test control TCP port' '54000' coord
-            prompt_with_default 'Test tunnel TCP port (reused for every transport)' '54001' port
+            prompt_with_default 'IRAN public IP or hostname' "$SERVER_IP" host || return 0
+            prompt_with_default 'Test control TCP port' '54000' coord || return 0
+            prompt_with_default 'Test tunnel TCP port (reused for every transport)' '54001' port || return 0
             [[ "$coord" =~ ^[0-9]{1,5}$ && "$port" =~ ^[0-9]{1,5}$ ]] &&
                 ((10#$coord >= 1 && 10#$coord <= 65535 && 10#$port >= 1 && 10#$port <= 65535 && 10#$coord != 10#$port)) || {
                     colorize red 'Choose two different ports between 1 and 65535.'; press_key; return 1;
@@ -2935,11 +3266,14 @@ start_traffic_responder() {
 test_connection_menu() {
     local file="$1" choice
     while true; do
-        colorize cyan "Test connection: $(basename "${file%.toml}")" bold
-        echo '1) Quick TCP reachability (10 sequential probes)'
-        echo '2) Real traffic test — start on IRAN (one selected mapping)'
-        echo '3) Start responder — KHAREJ (paste IRAN test link)'
-        echo '0) Back'
+        ui_header "TEST / $(basename "${file%.toml}")" 'Test only the selected tunnel. Keep both server terminals open.'
+        ui_item 1 'Quick TCP reachability · 10 probes'
+        if [[ "$(basename "$file")" == iran* ]]; then
+            ui_item 2 'Real traffic test · select a mapping & get a test link'
+        else
+            ui_item 3 'Start responder · paste the IRAN test link'
+        fi
+        ui_item 0 'Back'
         read -r -p 'Choose one test: ' choice || return 1
         case "$choice" in
             1) quick_connection_test "$file"; press_key ;;
@@ -2955,7 +3289,7 @@ tunnel_health_check() {
     local file="$1" name="$(basename "${1%.toml}")" cert token
     local service="backhaul-$name.service"
     edit_load_config "$file" || return 1
-    colorize cyan "Health check: $name" bold
+    ui_header "HEALTH / $name" 'Local checks, file locations and recent logs.'
     [[ -x "$config_dir/backhaul_premium" ]] && echo 'OK: Core is executable.' || echo "FIX: Download the core or chmod +x $config_dir/backhaul_premium"
     systemctl is-active --quiet "$service" && echo 'OK: Service is active.' || echo "FIX: Restart this tunnel and inspect its logs ($service)."
     echo "Config: $file"
@@ -2987,19 +3321,24 @@ tunnel_health_check() {
 toggle_tunnel_service() {
     local service="$1"
     if systemctl is-active --quiet "$service"; then
-        systemctl stop "$service" && colorize yellow 'Tunnel stopped. It can still start at boot if enabled.'
+        if systemctl stop "$service"; then
+            colorize yellow 'Tunnel stopped. It can still start at boot if enabled.'
+        else
+            colorize red 'Could not stop the tunnel. Check its service logs.'; press_key; return 1
+        fi
     else
         if systemctl start "$service" && sleep 1 && systemctl is-active --quiet "$service"; then
             colorize green 'Tunnel started.'
         else
             colorize red 'Tunnel could not start. View its service logs for details.'
+            press_key; return 1
         fi
     fi
     press_key
 }
 
 restore_tunnel_backup() {
-    local file="$1" edit_mode confirm
+    local file="$1" edit_mode confirm result=0
     [[ -f "$file.bak" ]] || { colorize red 'No previous configuration backup found.'; press_key; return 1; }
     [[ "$(basename "$file")" == iran* ]] && edit_mode=server || edit_mode=client
     edit_load_config "$file.bak" || return 1
@@ -3007,305 +3346,230 @@ restore_tunnel_backup() {
     echo "Restore $(edit_value transport.type) from $file.bak and restart this tunnel?"
     read -r -p 'Restore? [y/N]: ' confirm || return 1
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
-    edit_save_config "$file" "backhaul-$(basename "${file%.toml}").service"
+    edit_save_config "$file" "backhaul-$(basename "${file%.toml}").service" || result=$?
     press_key
+    return "$result"
 }
 
 # ============================================================================
 # SERVER INFO & DISPLAY FUNCTIONS
 # ============================================================================
 
-SERVER_IP=$(hostname -I | awk '{print $1}')
-SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country')
-SERVER_ISP=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.isp')
+SERVER_IP=""
+
+get_server_ip() {
+    local address
+    address=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    [[ -n "$address" ]] || address=$(hostname -I 2>/dev/null | awk '{print $1}')
+    printf '%s' "${address:-unknown}"
+}
+
+# Gather all service states once per screen, including failed/stopped units.
+declare -A TUNNEL_STATES=()
+declare -a TUNNEL_FILES=()
+collect_tunnels() {
+    local file name state unit
+    TUNNEL_FILES=(); TUNNEL_STATES=()
+    for file in "$config_dir"/{iran,kharej}*.toml; do
+        [[ -f "$file" ]] || continue
+        name="${file##*/}"
+        [[ "$name" =~ ^(iran|kharej)[0-9]+\.toml$ ]] && TUNNEL_FILES+=("$file")
+    done
+    while read -r unit _ state _; do
+        [[ "$unit" =~ ^backhaul-(iran|kharej)[0-9]+\.service$ ]] || continue
+        TUNNEL_STATES[$unit]="$state"
+    done < <(systemctl list-units --all --type=service --plain --no-legend --no-pager 'backhaul-*.service' 2>/dev/null)
+}
+
+tunnel_state() {
+    local service="backhaul-$(basename "${1%.toml}").service"
+    if [[ ! -f "$service_dir/$service" ]]; then printf 'missing service';
+    else printf '%s' "${TUNNEL_STATES[$service]:-inactive}"; fi
+}
 
 display_logo() {
-    echo -e "\033[36m"
-    cat << "EOF"
- ____  _   _
-| __ )| | | |
-|  _ \| |_| |
-| |_) |  _  |
-|____/|_| |_|
-
-Reverse tunneling manager
-EOF
-    echo -e "\033[0m\033[32m"
-    echo -e "Script Version: \033[33m${SCRIPT_VERSION}\033[32m"
-    [[ -f "${config_dir}/backhaul_premium" ]] && \
-        echo -e "Core Version: \033[33m$("$config_dir/backhaul_premium" -v | sed 's/[Bb]ackhaul/BH/g')\033[32m"
+    ui_header 'TUNNEL MANAGER' "$SCRIPT_VERSION · Reverse tunnels, made simple."
 }
 
 display_server_info() {
-    echo -e "\e[93m═══════════════════════════════════════════\e[0m"
-    echo -e "\033[36mIP Address:\033[0m $SERVER_IP"
-    echo -e "\033[36mLocation:\033[0m $SERVER_COUNTRY"
-    echo -e "\033[36mDatacenter:\033[0m $SERVER_ISP"
+    local os_name
+    os_name=$(awk -F= '$1=="PRETTY_NAME" {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null) || os_name=''
+    printf '  Server   %s\n' "${SERVER_IP:-unknown}"
+    [[ -n "$os_name" ]] && printf '  System   %s\n' "$os_name"
+    return 0
 }
 
 display_bh_core_status() {
-    if [[ -f "${config_dir}/backhaul_premium" ]]; then
-        echo -e "\033[36mBH Core:\033[0m \033[32mInstalled\033[0m"
-    else
-        echo -e "\033[36mBH Core:\033[0m \033[31mNot installed\033[0m"
-    fi
-    echo -e "\e[93m═══════════════════════════════════════════\e[0m"
+    local file state running=0 attention=0
+    for file in "${TUNNEL_FILES[@]}"; do
+        state=$(tunnel_state "$file")
+        if [[ "$state" == active ]]; then ((running+=1)); else ((attention+=1)); fi
+    done
+    if [[ -x "$config_dir/backhaul_premium" ]]; then colorize green '  Core     Installed';
+    else colorize yellow '  Core     Not installed · choose 1 or 4 to install'; fi
+    printf '  Tunnels  %s total  /  %s running  /  %s need attention\n' "${#TUNNEL_FILES[@]}" "$running" "$attention"
+    ui_rule
 }
 
 check_config_backup() {
-    missing_services=()
-
-    for config in "${config_dir}"/iran*.toml "${config_dir}"/kharej*.toml; do
-        [ -e "$config" ] || continue
-
-        fname=$(basename "$config")
-        if [[ "$fname" =~ ^(iran|kharej)([0-9]+)\.toml$ ]]; then
-            location="${BASH_REMATCH[1]}"
-            tunnel_port="${BASH_REMATCH[2]}"
-            service_file="${service_dir}/backhaul-${location}${tunnel_port}.service"
-
-            if [[ ! -f "$service_file" ]]; then
-                missing_services+=("$service_file:$location:$tunnel_port")
-            fi
-        fi
+    local file name role port missing=0 failed=0
+    local -a missing_files=()
+    collect_tunnels
+    for file in "${TUNNEL_FILES[@]}"; do
+        [[ "$(tunnel_state "$file")" == 'missing service' ]] && missing_files+=("$file")
     done
-
-    [[ ${#missing_services[@]} -eq 0 ]] && return 0
-
-    echo
-    colorize red "Missing service files:" bold
-    for entry in "${missing_services[@]}"; do
-        service_file="${entry%%:*}"
-        location="${entry#*:}"; location="${location%%:*}"
-        tunnel_port="${entry##*:}"
-        echo "- $service_file (type: $location, port: $tunnel_port)"
+    ((${#missing_files[@]})) || return 0
+    ui_section 'Repair missing services'
+    ui_hint 'These configurations exist but have no service:'
+    for file in "${missing_files[@]}"; do ui_hint "  $(basename "${file%.toml}")"; done
+    ui_confirm 'Recreate and start these services?' || return 0
+    for file in "${missing_files[@]}"; do
+        name=$(basename "${file%.toml}")
+        [[ "$name" =~ ^(iran|kharej)([0-9]+)$ ]] || continue
+        role="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+        create_systemd_service "$role" "$port" "$file" || failed=1
     done
-
-    echo
-    read -r -p "Do you want to create missing service files? (y/n): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        for entry in "${missing_services[@]}"; do
-            service_file="${entry%%:*}"
-            location="${entry#*:}"; location="${location%%:*}"
-            tunnel_port="${entry##*:}"
-
-            config_file="${config_dir}/${location}${tunnel_port}.toml"
-            desc_loc="$(tr '[:lower:]' '[:upper:]' <<< "${location:0:1}")${location:1}"
-
-            cat > "$service_file" <<EOF
-[Unit]
-Description=BH $desc_loc Port $tunnel_port
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${config_dir}/backhaul_premium -c $config_file
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            sudo systemctl daemon-reload
-            sudo systemctl enable --now "$(basename "$service_file")"
-            echo "Created and started $(basename "$service_file")"
-        done
-    fi
-    sleep 2
+    press_key
+    return "$failed"
 }
 
-check_config_backup
-
-# ============================================================================
-# TUNNEL MANAGEMENT FUNCTIONS
-# ============================================================================
+show_tunnel_rows() {
+    local file name role port state color index=0
+    for file in "${TUNNEL_FILES[@]}"; do
+        name=$(basename "${file%.toml}")
+        [[ "$name" =~ ^(iran|kharej)([0-9]+)$ ]] || continue
+        role="${BASH_REMATCH[1]^^}"; port="${BASH_REMATCH[2]}"
+        state=$(tunnel_state "$file")
+        case "$state" in active) color=green ;; failed|'missing service') color=red ;; *) color=yellow ;; esac
+        ((index+=1))
+        colorize "$color" "  $index) $role :$port  [$state]"
+    done
+}
 
 check_tunnel_status() {
-    if ! ls "$config_dir"/*.toml 1> /dev/null 2>&1; then
-        colorize red "No config files found." bold
-        press_key
-        return 1
-    fi
-
-    clear
-    colorize yellow "Checking all services status..." bold
-    sleep 1
-    echo
-
-    for config_path in "$config_dir"/{iran,kharej}*.toml; do
-        [ -f "$config_path" ] || continue
-
-        config_name=$(basename "$config_path")
-        config_name="${config_name%.toml}"
-        service_name="backhaul-${config_name}.service"
-
-        if [[ "$config_name" =~ ^iran([0-9]+)$ ]]; then
-            port="${BASH_REMATCH[1]}"
-            if systemctl is-active --quiet "$service_name"; then
-                colorize green "Iran service (port $port) is running"
-            else
-                colorize red "Iran service (port $port) is not running"
-            fi
-        elif [[ "$config_name" =~ ^kharej([0-9]+)$ ]]; then
-            port="${BASH_REMATCH[1]}"
-            if systemctl is-active --quiet "$service_name"; then
-                colorize green "Kharej service (port $port) is running"
-            else
-                colorize red "Kharej service (port $port) is not running"
-            fi
-        fi
-    done
-
-    echo
+    collect_tunnels
+    ui_header 'STATUS' 'Service status describes this server. Use Test connection to verify both ends.'
+    if ((${#TUNNEL_FILES[@]})); then show_tunnel_rows;
+    else ui_hint 'No tunnels yet. Choose New tunnel on the home screen.'; fi
     press_key
 }
 
 tunnel_management() {
-    if ! ls "$config_dir"/*.toml 1> /dev/null 2>&1; then
-        colorize red "No config files found." bold
-        press_key
-        return 1
-    fi
-
-    clear
-    colorize cyan "Existing services:" bold
-    echo
-
-    local index=1
-    declare -a configs
-
-    for config_path in "$config_dir"/{iran,kharej}*.toml; do
-        [ -f "$config_path" ] || continue
-
-        config_name=$(basename "$config_path")
-
-        if [[ "$config_name" =~ ^iran([0-9]+)\.toml$ ]]; then
-            port="${BASH_REMATCH[1]}"
-            configs+=("$config_path")
-            echo -e "\033[35m${index}\033[0m) \033[32mIran\033[0m (port: \033[33m$port\033[0m)"
-            ((index++))
-        elif [[ "$config_name" =~ ^kharej([0-9]+)\.toml$ ]]; then
-            port="${BASH_REMATCH[1]}"
-            configs+=("$config_path")
-            echo -e "\033[35m${index}\033[0m) \033[32mKharej\033[0m (port: \033[33m$port\033[0m)"
-            ((index++))
+    local choice selected_config config_name service_name state
+    while true; do
+        collect_tunnels
+        ui_header 'MY TUNNELS' 'Select a tunnel to see its settings and actions.'
+        if ((${#TUNNEL_FILES[@]} == 0)); then
+            ui_hint 'No tunnels yet. Start with New tunnel on the home screen.'; press_key; return 0
         fi
+        show_tunnel_rows
+        ui_section 'TOOLS'
+        ui_item r 'Repair missing services'
+        ui_item 0 'Back to home'
+        ui_read_choice choice || return 0
+        case "$choice" in
+            0|q|Q) return 0 ;;
+            r|R) check_config_backup; continue ;;
+        esac
+        if [[ ! "$choice" =~ ^[0-9]{1,3}$ ]] || ((10#$choice < 1 || 10#$choice > ${#TUNNEL_FILES[@]})); then
+            colorize red 'Choose one of the listed tunnels.'; press_key; continue
+        fi
+        selected_config="${TUNNEL_FILES[$((10#$choice-1))]}"
+        config_name=$(basename "${selected_config%.toml}")
+        service_name="backhaul-${config_name}.service"
+        while [[ -f "$selected_config" ]]; do
+            collect_tunnels
+            state=$(tunnel_state "$selected_config")
+            ui_header "$config_name" "Service: $state"
+            if edit_load_config "$selected_config"; then show_config_summary; fi
+            ui_section 'CONFIGURE & VERIFY'
+            ui_item 1 'Edit settings'
+            ui_item 2 'Test connection'
+            [[ "$config_name" == iran* ]] && ui_item 3 'Copy KHAREJ setup link'
+            ui_item 4 'Health check & file locations'
+            ui_section 'SERVICE'
+            ui_item 5 'Restart tunnel'
+            [[ "$state" == active ]] && ui_item 6 'Stop tunnel' || ui_item 6 'Start tunnel'
+            ui_item 7 'Recent logs'
+            ui_item 8 'Service details'
+            [[ -f "$selected_config.bak" ]] && ui_item 9 'Restore previous settings'
+            ui_item d 'Delete this tunnel'
+            ui_item 0 'Back to tunnel list'
+            ui_read_choice choice || return 0
+            case "$choice" in
+                0|q|Q) break ;;
+                1) edit_tunnel "$selected_config" ;;
+                2) test_connection_menu "$selected_config" ;;
+                3) if [[ "$config_name" == iran* ]]; then show_setup_link "$selected_config"; fi ;;
+                4) tunnel_health_check "$selected_config" ;;
+                5) restart_service "$service_name" ;;
+                6) toggle_tunnel_service "$service_name" ;;
+                7) view_service_logs "$service_name" ;;
+                8) view_service_status "$service_name" ;;
+                9) restore_tunnel_backup "$selected_config" ;;
+                d|D) destroy_tunnel "$selected_config" ;;
+                *) colorize red 'Choose one of the listed actions.'; press_key ;;
+            esac
+        done
     done
-
-    echo
-    echo -ne "Enter your choice (0 to return): "
-    read -r choice
-
-    [[ "$choice" == "0" ]] && return
-
-    while ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#configs[@]} )); do
-        colorize red "Invalid choice."
-        echo -ne "Enter your choice (0 to return): "
-        read -r choice
-        [[ "$choice" == "0" ]] && return
-    done
-
-    selected_config="${configs[$((choice - 1))]}"
-    config_name=$(basename "${selected_config%.toml}")
-    service_name="backhaul-${config_name}.service"
-
-    clear
-    colorize cyan "Manage $config_name:" bold
-    echo
-    colorize red "1) Remove this tunnel"
-    colorize yellow "2) Restart this tunnel"
-    echo "3) View service logs"
-    echo "4) View service status"
-    colorize cyan "5) Edit this tunnel (easy menu)"
-    echo "6) Test connection (one tunnel at a time)"
-    echo "7) Show setup link for KHAREJ"
-    echo "8) Health check and file locations"
-    echo "9) Start / stop this tunnel"
-    echo "10) Restore previous configuration"
-    echo
-    read -r -p "Enter your choice (0 to return): " choice
-
-    case $choice in
-        1) destroy_tunnel "$selected_config" ;;
-        2) restart_service "$service_name" ;;
-        3) view_service_logs "$service_name" ;;
-        4) view_service_status "$service_name" ;;
-        5) edit_tunnel "$selected_config" ;;
-        6) test_connection_menu "$selected_config" ;;
-        7) show_setup_link "$selected_config" ;;
-        8) tunnel_health_check "$selected_config" ;;
-        9) toggle_tunnel_service "$service_name" ;;
-        10) restore_tunnel_backup "$selected_config" ;;
-        0) return ;;
-        *) colorize red "Invalid option!" && sleep 1 ;;
-    esac
 }
 
 destroy_tunnel() {
-    config_path="$1"
+    local config_path="$1" config_name service_name service_path
     config_name=$(basename "${config_path%.toml}")
+    [[ "$config_path" == "$config_dir/$config_name.toml" && "$config_name" =~ ^(iran|kharej)[0-9]+$ ]] || return 1
     service_name="backhaul-${config_name}.service"
     service_path="$service_dir/$service_name"
-
-    [ -f "$config_path" ] && rm -f "$config_path"
-
-    if [[ -f "$service_path" ]]; then
-        systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
-        rm -f "$service_path"
+    colorize yellow "Delete $config_name, its service, and its previous configuration?"
+    ui_confirm 'Delete this tunnel permanently?' || return 0
+    # Disable stopped services too, otherwise stale boot symlinks survive deletion.
+    if [[ -f "$service_path" ]] || systemctl is-active --quiet "$service_name"; then
+        if ! systemctl disable --now "$service_name"; then
+            colorize red 'Could not stop/disable the service. Files were kept.'; press_key; return 1
+        fi
     fi
-
-    systemctl daemon-reload
-    echo
-    colorize green "Tunnel destroyed successfully!" bold
-    echo
+    if ! rm -f "$config_path" "$config_path.bak" "$service_path" || ! systemctl daemon-reload; then
+        colorize red 'Deletion could not finish. Check service details.'; press_key; return 1
+    fi
+    colorize green 'Tunnel deleted.'
     press_key
 }
 
 restart_service() {
-    echo
-    colorize yellow "Restarting $1" bold
-
-    if systemctl list-units --type=service | grep -q "$1"; then
-        systemctl restart "$1"
-        colorize green "Service restarted successfully" bold
-        echo
+    local service="$1"
+    colorize cyan "Restarting $service..."
+    if systemctl restart "$service" && sleep 1 && systemctl is-active --quiet "$service"; then
+        colorize green 'Tunnel restarted.'
     else
-        colorize red "Service not found"
+        colorize red 'Restart failed. Check Recent logs for the cause.'; press_key; return 1
     fi
     press_key
 }
 
 view_service_logs() {
-    clear
-    journalctl -eu "$1" -f -o cat
+    ui_header 'RECENT LOGS' "$1 · last 60 lines"
+    journalctl -u "$1" -n 60 --no-pager -o cat
+    press_key
 }
 
 view_service_status() {
-    clear
-    systemctl status "$1"
+    ui_header 'SERVICE DETAILS' "$1"
+    systemctl status --no-pager -l "$1"
     press_key
 }
 
 remove_core() {
-    if find "$config_dir" -type f -name "*.toml" | grep -q .; then
-        colorize red "Delete all services first."
-        sleep 3
-        return 1
-    fi
-
-    colorize yellow "Remove BH-Core? (y/n)"
-    read -r confirm
-
-    if [[ $confirm == [yY] ]]; then
-        [[ -d "$config_dir" ]] && rm -rf "$config_dir"
-        colorize green "BH-Core removed." bold
-    fi
+    local file
+    for file in "$config_dir"/*.toml "$service_dir"/backhaul-{iran,kharej}*.service; do
+        if [[ -e "$file" ]]; then
+            colorize red 'Delete existing tunnels from My tunnels before removing BH Core.'; press_key; return 1
+        fi
+    done
+    [[ -d "$config_dir" ]] || { ui_hint 'BH Core is already removed.'; press_key; return 0; }
+    [[ "$config_dir" == /root/backhaul-core ]] || { colorize red 'Refusing to remove an unexpected installation directory.'; return 1; }
+    ui_confirm 'Remove BH Core and its certificate files?' || return 0
+    if rm -rf -- "$config_dir"; then colorize green 'BH Core removed.';
+    else colorize red 'Could not remove BH Core.'; press_key; return 1; fi
     press_key
 }
 
@@ -3337,68 +3601,118 @@ update_script() {
     exit 0
 }
 
+ensure_core() {
+    [[ -x "$config_dir/backhaul_premium" ]] && return 0
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) colorize red 'The bundled BH Core requires Linux x86-64.'; press_key; return 1 ;;
+    esac
+    download_bh ''
+}
+
 configure_tunnel() {
-    [[ ! -d "$config_dir" ]] && {
-        colorize red "Install BH-Core first."
-        press_key
-        return 1
-    }
-
-    clear
-    echo ""
-    colorize green "1) Configure IRAN (Server)" bold
-    colorize magenta "2) Configure KHAREJ (Client)" bold
-    colorize cyan "3) Setup KHAREJ from an IRAN setup link" bold
-    echo ""
-    read -r -p "Enter your choice: " configure_choice
-
+    local configure_choice setup_style=quick
+    ui_header 'NEW TUNNEL' 'Start on IRAN, then paste its setup link on KHAREJ.'
+    ui_section 'QUICK SETUP · sensible defaults'
+    ui_item 1 'IRAN · create the server tunnel'
+    ui_item 2 'KHAREJ · paste an IRAN setup link (recommended)'
+    ui_section 'MANUAL SETUP'
+    ui_item 3 'KHAREJ · enter connection details manually'
+    ui_item 4 'Advanced · IRAN server'
+    ui_item 5 'Advanced · KHAREJ client'
+    ui_item 0 'Back to home'
+    ui_read_choice configure_choice || return 0
     case "$configure_choice" in
-        1) configure_server "server" ;;
-        2) configure_server "client" ;;
-        3) setup_from_link ;;
-        *) colorize red "Invalid option!" && sleep 1 ;;
+        0|q|Q) return 0 ;;
+        1|2|3|4|5) ensure_core || return 1 ;;
+        *) colorize red 'Choose an option from 0 to 5.'; press_key; return 1 ;;
+    esac
+    case "$configure_choice" in
+        1) configure_server server quick ;;
+        2) setup_from_link ;;
+        3) configure_server client quick ;;
+        4) configure_server server advanced ;;
+        5) configure_server client advanced ;;
     esac
 }
 
-# ============================================================================
-# MENU SYSTEM
-# ============================================================================
-
 display_menu() {
-    clear
+    collect_tunnels
     display_logo
     display_server_info
     display_bh_core_status
-
-    echo
-    colorize green " 1. Configure a new tunnel" bold
-    colorize red " 2. Tunnel management" bold
-    colorize cyan " 3. Check tunnel status" bold
-    echo " 4. Update BH Core"
-    echo " 5. Update script"
-    echo " 6. Remove BH Core"
-    colorize cyan " 7. Test all transports (ping and speed)" bold
-    echo " 0. Exit"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if ((${#TUNNEL_FILES[@]} == 0)); then
+        ui_section 'GET STARTED'
+        ui_hint 'Create the IRAN tunnel first, then use its link on KHAREJ.'
+    else
+        ui_section 'YOUR WORKSPACE'
+    fi
+    ui_item 1 'New tunnel'
+    ui_item 2 'My tunnels · edit, test, logs & services'
+    ui_item 3 'Tunnel status'
+    ui_item 7 'Compare transports · ping & speed'
+    ui_section 'MAINTENANCE'
+    ui_item 4 'Install / update BH Core'
+    ui_item 5 'Update this script'
+    ui_item 6 'Remove BH Core'
+    ui_rule
+    ui_item 0 'Exit'
 }
 
 read_option() {
-    read -r -p "Enter your choice [0-7]: " choice
-    case $choice in
+    local choice
+    ui_read_choice choice || return 2
+    case "$choice" in
         1) configure_tunnel ;;
         2) tunnel_management ;;
         3) check_tunnel_status ;;
-        4) download_bh "menu" ;;
+        4) download_bh menu; press_key ;;
         5) update_script ;;
         6) remove_core ;;
         7) test_all_transports_menu ;;
-        0) exit 0 ;;
-        *) colorize red "Invalid option!" && sleep 1 ;;
+        0|q|Q) return 2 ;;
+        *) colorize red 'Choose an option from 0 to 7.'; press_key ;;
     esac
+    return 0
 }
 
-# Main loop
-while true; do
-    display_menu
-    read_option
-done
+show_help() {
+    printf 'BH tunnel manager %s\n\n' "$SCRIPT_VERSION"
+    printf '%s\n' 'Usage: bash bh.sh [--no-color | --help | --version]'
+    printf '%s\n' 'Run on Linux with systemd and Bash 4+, as root.'
+    printf '%s\n' 'The bundled core supports x86-64. Start on IRAN, then import its setup link on KHAREJ.'
+    printf '%s\n' 'Menus: enter a number; 0 goes back; /cancel leaves a setup prompt; Ctrl+D exits.'
+    printf '%s\n' 'Set NO_COLOR=1 or pass --no-color for plain output.'
+}
+
+main() {
+    local argument
+    for argument in "$@"; do
+        case "$argument" in
+            --help|-h) show_help; return 0 ;;
+            --version|-v) printf '%s\n' "$SCRIPT_VERSION"; return 0 ;;
+            --no-color) export NO_COLOR=1 ;;
+            *) printf 'Unknown option: %s\n' "$argument" >&2; show_help >&2; return 1 ;;
+        esac
+    done
+    [[ "$(uname -s)" == Linux ]] || { colorize red 'Run BH on a Linux server with systemd.'; return 1; }
+    [[ $EUID -eq 0 ]] || { colorize red 'Run as root: sudo bash bh.sh'; return 1; }
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null || {
+        colorize red 'BH requires a running systemd installation.'; return 1;
+    }
+    command -v curl >/dev/null || { colorize red 'Install curl before running BH.'; return 1; }
+    install_dependencies || { colorize red 'Could not install/find jq.'; return 1; }
+    umask 077
+    mkdir -p "$config_dir" "$CERT_DIR" || return 1
+    SERVER_IP=$(get_server_ip)
+    # EOF is a normal exit, including redirected input and disconnected SSH sessions.
+    while true; do
+        display_menu
+        read_option || break
+    done
+    printf '\n  Goodbye.\n'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

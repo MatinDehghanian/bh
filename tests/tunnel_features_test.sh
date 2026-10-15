@@ -4,8 +4,7 @@ set -eo pipefail
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'test_status=$?; if ((test_status)); then tail -40 "$test_dir/output.log" >&2; fi; rm -rf "$test_dir"' EXIT
-source <(sed -n '/^colorize() {/,/^install_jq() {/p' "$repo_dir/bh.sh" | sed '$d')
-source <(sed -n '/^declare -A CONFIG/,/^SERVER_IP=/p' "$repo_dir/bh.sh" | sed '$d')
+source "$repo_dir/bh.sh"
 config_dir="$test_dir/configs"
 service_dir="$test_dir/services"
 CERT_DIR="$test_dir/certs"
